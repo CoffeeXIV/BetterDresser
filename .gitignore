@@ -1,0 +1,12 @@
+# Build output: dotnet build makes it again.
+bin/
+obj/
+
+# Editors.
+.vs/
+.idea/
+.vscode/
+*.user
+*.DotSettings.user
+
+CLAUDE.md
