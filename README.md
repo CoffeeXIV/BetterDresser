@@ -1,5 +1,3 @@
-<p align="center"><img src="images/icon.png" width="128" alt="BetterDresser icon"></p>
-
 # BetterDresser
 
 BetterDresser is a catalog of every piece of gear in FFXIV. Browse it by slot, see each item as a screenshot of the model,
