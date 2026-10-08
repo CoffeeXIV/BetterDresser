@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>0.1.0.0</Version>
+    <Version>0.1.1.0</Version>
     <Author>CoffeeXIV</Author>
     <Name>BetterDresser</Name>
     <AssemblyName>BetterDresser</AssemblyName>
-    <Punchline>Catalog of all gear with screenshot previews, click to try it on via Glamourer.</Punchline>
+    <Punchline>Catalog of all gear with model previews, click to try it on via Glamourer.</Punchline>
     <Description>Browse every piece of equipment in the game and apply it to your character with Glamourer.</Description>
-    <Tags>glamour;glamourer;gear;catalog;screenshots;dresser;preview;fashion</Tags>
+    <Tags>glamour;glamourer;gear;catalog;screenshots;dresser;previews;fashion</Tags>
     <IconUrl>https://raw.githubusercontent.com/CoffeeXIV/BetterDresser/main/images/icon.png</IconUrl>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>

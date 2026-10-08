@@ -13,10 +13,11 @@ using Dalamud.Interface.Textures;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
-using Dalamud.Plugin.Ipc.Exceptions;
 using Glamourer.Api.Enums;
+using Glamourer.Api.IpcSubscribers;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
+using Newtonsoft.Json.Linq;
 using ItemFinderModule = FFXIVClientStructs.FFXIV.Client.UI.Misc.ItemFinderModule;
 using UIState = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState;
 
@@ -29,12 +30,12 @@ public class MainWindow : Window, IDisposable
     private record Entry(uint Id, string Name, uint JobCategory, uint Icon, ulong ModelMain, ulong ModelSub, byte Dyes, bool Store, Patch? Patch,
         bool Male, bool Female);
 
-    // The game icon on screenshot tiles; icon mode takes Config.IconSize.
+    // The game icon on preview tiles; icon mode takes Config.IconSize.
     private const float IconSize = 48;
 
     private const string MalePack = "male", FemalePack = "female";
 
-    // Screenshots are in shots/<pack>/<folder>/, as DresserPhoto writes them. Pack null: male or female by the gender shown.
+    // Previews are in shots/<pack>/<folder>/, as DresserPhoto writes them. Pack null: male or female by the gender shown.
     // Both ring tabs share one folder. Weapons are shot sheathed, in back or waist by the job: a model is in one of them,
     // shields are in back.
     // Packs are offered for download in PacksWindow.
@@ -54,6 +55,20 @@ public class MainWindow : Window, IDisposable
         ("Right Ring", ApiEquipSlot.RFinger, "accessories", ["ring"]),
     ];
 
+    // The revert button, and its step in the history.
+    private const string RevertName = "Reset outfit";
+
+    // Every gear slot, in tab order: the main hand goes on before the off hand.
+    private static readonly ApiEquipSlot[] Slots = Tabs.Select(t => t.Slot).ToArray();
+
+    // Glamourer's toggles in the row under the search. On is Equipment.<Key>.<Field> in its state.
+    private static readonly (MetaFlag Flag, string Key, string Field, FontAwesomeIcon Icon, string Name)[] Toggles =
+    [
+        (MetaFlag.HatState, "Hat", "Show", FontAwesomeIcon.HatCowboy, "Headgear"),
+        (MetaFlag.VisorState, "Visor", "IsToggled", FontAwesomeIcon.Glasses, "Visor"),
+        (MetaFlag.EarState, "VieraEars", "Show", FontAwesomeIcon.Deaf, "Viera ears"),
+    ];
+
     private static readonly GameInventoryType[] Containers =
     [
         GameInventoryType.Inventory1, GameInventoryType.Inventory2, GameInventoryType.Inventory3, GameInventoryType.Inventory4,
@@ -64,17 +79,23 @@ public class MainWindow : Window, IDisposable
     ];
 
     private readonly Dictionary<ApiEquipSlot, List<Entry>> items = Tabs.ToDictionary(t => t.Slot, _ => new List<Entry>());
-    // Screenshot files on disk per pack and folder: ModelMain -> path.
-    private readonly Dictionary<(string Pack, string Folder), Dictionary<ulong, string>> shots = [];
-    // Height to width of the shots per pack and folder, from the first one loaded.
+    // Preview files on disk per pack and folder: ModelMain -> path.
+    private readonly Dictionary<(string Pack, string Folder), Dictionary<ulong, string>> previewFiles = [];
+    // Height to width of the previews per pack and folder, from the first one loaded.
     private readonly Dictionary<(string Pack, string Folder), float> aspects = [];
     private readonly FileSystemWatcher watcher;
     // When files under shots/ last changed, 0 once rescanned. Set on the watcher's thread and after downloads.
-    private long shotsChangedAt;
-    private readonly ColorsWindow colorsWindow;
+    private long previewsChangedAt;
+    private readonly DyesWindow dyesWindow;
     private readonly PacksWindow packsWindow;
     private readonly Pins pins;
     private readonly History history;
+    private readonly GetState getState = new(Plugin.PluginInterface);
+    private readonly SetMetaState setMetaState = new(Plugin.PluginInterface);
+    private readonly RevertState revertState = new(Plugin.PluginInterface);
+    private readonly AddDesign addDesign = new(Plugin.PluginInterface);
+    private readonly OpenDesign openDesign = new(Plugin.PluginInterface);
+    private string presetName = string.Empty;
     // Patch filter options, newest first: each expansion's name, then the versions of its patches that added gear.
     private List<(string Name, bool Expansion)> patchFilters = [];
     // The widest of them, measured again only when the font size changes: the list is fixed once loaded.
@@ -89,35 +110,38 @@ public class MainWindow : Window, IDisposable
     // Gender picked with the button in the status bar, for that character only: not saved, dropped on switching characters.
     private (ulong Character, bool Female)? picked;
 
-    public MainWindow(ColorsWindow colorsWindow, PacksWindow packsWindow, Pins pins) : base("BetterDresser")
+    // Not scrolled by the wheel itself: everything fits in it, and with previews the list passes the wheel on to it
+    // (NoScrollWithMouse), so an overflow would scroll the whole window along with the list.
+    public MainWindow(DyesWindow dyesWindow, PacksWindow packsWindow, Pins pins, History history)
+        : base("BetterDresser", ImGuiWindowFlags.NoScrollWithMouse)
     {
-        this.colorsWindow = colorsWindow;
+        this.dyesWindow = dyesWindow;
         this.packsWindow = packsWindow;
         this.pins = pins;
-        history = new History(pins);
+        this.history = history;
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(350, 400), MaximumSize = new Vector2(float.MaxValue) };
         LoadItems();
-        LoadShots();
+        LoadPreviews();
 
         // Files copied in or removed show up on their own. Too many changes at once overflow the watcher (Error): rescan all the same.
-        Directory.CreateDirectory(ShotsRoot);
-        watcher = new FileSystemWatcher(ShotsRoot) { IncludeSubdirectories = true };
-        watcher.Created += OnShotsChanged;
-        watcher.Deleted += OnShotsChanged;
-        watcher.Renamed += OnShotsChanged;
-        watcher.Error += OnShotsChanged;
+        Directory.CreateDirectory(PreviewsRoot);
+        watcher = new FileSystemWatcher(PreviewsRoot) { IncludeSubdirectories = true };
+        watcher.Created += OnPreviewsChanged;
+        watcher.Deleted += OnPreviewsChanged;
+        watcher.Renamed += OnPreviewsChanged;
+        watcher.Error += OnPreviewsChanged;
         watcher.EnableRaisingEvents = true;
         // Downloads and deletes rescan even if the watcher has missed them: under Wine it may not report changes.
-        packsWindow.ShotsChanged += OnShotsChanged;
+        packsWindow.PreviewsChanged += OnPreviewsChanged;
     }
 
     public void Dispose()
     {
-        packsWindow.ShotsChanged -= OnShotsChanged;
+        packsWindow.PreviewsChanged -= OnPreviewsChanged;
         watcher.Dispose();
     }
 
-    // Gear put on while the catalog is open outlasts job changes. The first time, the screenshot packs are offered.
+    // Gear put on while the catalog is open outlasts job changes. The first time, the preview packs are offered.
     public override void OnOpen()
     {
         pins.Active = true;
@@ -134,18 +158,19 @@ public class MainWindow : Window, IDisposable
         pins.Release();
     }
 
-    internal static string ShotsRoot => Path.Combine(Plugin.PluginInterface.ConfigDirectory.FullName, "shots");
+    // The folder keeps its name from before the previews were called so: renamed, the packs already downloaded would be lost.
+    internal static string PreviewsRoot => Path.Combine(Plugin.PluginInterface.ConfigDirectory.FullName, "shots");
 
-    private void OnShotsChanged(object? sender, EventArgs e) => shotsChangedAt = Environment.TickCount64;
+    private void OnPreviewsChanged(object? sender, EventArgs e) => previewsChangedAt = Environment.TickCount64;
 
     // Same layout as DresserPhoto writes: shots/<pack>/<folder>/<ModelMain>.<jpg|png>.
     // About 10-20 ms for three full packs (23 000 files), fine to do in a frame now and then.
-    private void LoadShots()
+    private void LoadPreviews()
     {
-        shotsChangedAt = 0;
-        shots.Clear();
+        previewsChangedAt = 0;
+        previewFiles.Clear();
         aspects.Clear();
-        var root = ShotsRoot;
+        var root = PreviewsRoot;
         if (!Directory.Exists(root))
             return;
 
@@ -156,7 +181,7 @@ public class MainWindow : Window, IDisposable
                 var pack = Path.GetFileName(packDir);
                 foreach (var dir in Directory.EnumerateDirectories(packDir))
                 {
-                    var files = shots[(pack, Path.GetFileName(dir))] = [];
+                    var files = previewFiles[(pack, Path.GetFileName(dir))] = [];
                     foreach (var path in Directory.EnumerateFiles(dir))
                     {
                         var ext = Path.GetExtension(path).ToLowerInvariant();
@@ -170,7 +195,7 @@ public class MainWindow : Window, IDisposable
         // Windows denies access to a folder that is being deleted.
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            shotsChangedAt = Environment.TickCount64;
+            previewsChangedAt = Environment.TickCount64;
         }
     }
 
@@ -178,30 +203,30 @@ public class MainWindow : Window, IDisposable
 
     internal static string GenderPack(bool female) => female ? FemalePack : MalePack;
 
-    // DresserPhoto crops all shots of a folder with one frame, so any one of them gives the tile shape. 1:2 until one has loaded.
-    private float ShotAspect(string pack, string folder)
+    // DresserPhoto crops all previews of a folder with one frame, so any one of them gives the tile shape. 1:2 until one has loaded.
+    private float PreviewAspect(string pack, string folder)
     {
         if (aspects.TryGetValue((pack, folder), out var aspect))
             return aspect;
-        if (!shots.TryGetValue((pack, folder), out var files) || files.Count == 0
+        if (!previewFiles.TryGetValue((pack, folder), out var files) || files.Count == 0
             || !Plugin.TextureProvider.GetFromFile(files.Values.First()).TryGetWrap(out var image, out _))
             return 2;
         return aspects[(pack, folder)] = (float)image.Height / image.Width;
     }
 
-    // The folder whose shots give the tab's tile shape. A job's weapons all hang in one place,
+    // The folder whose previews give the tab's tile shape. A job's weapons all hang in one place,
     // so it is the first folder with any of the list in it.
     private string ShapeFolder(string pack, string[] folders, List<Entry> list) =>
         folders.Length == 1 ? folders[0]
-            : folders.FirstOrDefault(f => shots.TryGetValue((pack, f), out var files) && list.Any(e => files.ContainsKey(e.ModelMain))) ?? folders[0];
+            : folders.FirstOrDefault(f => previewFiles.TryGetValue((pack, f), out var files) && list.Any(e => files.ContainsKey(e.ModelMain))) ?? folders[0];
 
-    // Gendered tabs: the pack of the gender shown, but items it can't wear were shot on the other gender only.
-    // Of several folders the model is in one: the first that has it.
-    private string? ShotOf(string? pack, string[] folders, Entry e, bool female)
+    // Gendered tabs: the pack of the gender shown, which can wear every item listed. Of several folders the model is in one:
+    // the first that has it.
+    private string? PreviewOf(string? pack, string[] folders, Entry e, bool female)
     {
-        pack ??= GenderPack(female ? e.Female : !e.Male);
+        pack ??= GenderPack(female);
         foreach (var folder in folders)
-            if (shots.TryGetValue((pack, folder), out var files) && files.TryGetValue(e.ModelMain, out var path))
+            if (previewFiles.TryGetValue((pack, folder), out var files) && files.TryGetValue(e.ModelMain, out var path))
                 return path;
         return null;
     }
@@ -376,18 +401,11 @@ public class MainWindow : Window, IDisposable
     private static float CheckboxWidth(string label) =>
         ImGui.GetFrameHeight() + ImGui.GetStyle().ItemInnerSpacing.X + ImGui.CalcTextSize(label).X;
 
-    // As ImGuiComponents.IconButton sizes itself: the glyph in the icon font and the frame padding.
-    private static float IconButtonWidth(FontAwesomeIcon icon)
-    {
-        using var font = ImRaii.PushFont(UiBuilder.IconFont);
-        return ImGui.CalcTextSize(icon.ToIconString()).X + ImGui.GetStyle().FramePadding.X * 2;
-    }
-
     public override void Draw()
     {
         const string storeToggle = "Hide store";
         const string ownedToggle = "Owned";
-        const string toggle = "Screenshots";
+        const string toggle = "Previews";
         ImGui.SetNextItemWidth(-CheckboxWidth(storeToggle) - CheckboxWidth(ownedToggle) - CheckboxWidth(toggle) - ImGui.GetStyle().ItemSpacing.X * 3);
         ImGui.InputTextWithHint("##search", "Search", ref search, 100);
         ImGui.SameLine();
@@ -417,63 +435,47 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.SameLine();
-        var screenshots = Plugin.Config.Screenshots;
-        if (ImGui.Checkbox(toggle, ref screenshots))
+        var previews = Plugin.Config.Previews;
+        if (ImGui.Checkbox(toggle, ref previews))
         {
-            Plugin.Config.Screenshots = screenshots;
+            Plugin.Config.Previews = previews;
             Plugin.Config.Save();
         }
 
         // Rescan once the files have been left alone for a second: copying or unpacking a pack changes thousands of them.
-        if (shotsChangedAt != 0 && Environment.TickCount64 - shotsChangedAt > 1000)
-            LoadShots();
+        if (previewsChangedAt != 0 && Environment.TickCount64 - previewsChangedAt > 1000)
+            LoadPreviews();
 
         // A frame tall whatever is on it, so the grid below doesn't jump.
         ImGui.AlignTextToFramePadding();
-        var tileSize = screenshots ? Plugin.Config.ShotWidth : Plugin.Config.IconSize;
-        ImGui.SetNextItemWidth(150 * ImGuiHelpers.GlobalScale);
+        var tileSize = previews ? Plugin.Config.PreviewWidth : Plugin.Config.IconSize;
+        ImGui.SetNextItemWidth(350 * ImGuiHelpers.GlobalScale);
         // Clamped on Ctrl+click input too: ImGui lets typed values past the bounds otherwise.
-        if (ImGui.SliderInt("##size", ref tileSize, screenshots ? Config.MinShotWidth : Config.MinIconSize,
-                screenshots ? Config.MaxShotWidth : Config.MaxIconSize, "Image size %d", ImGuiSliderFlags.AlwaysClamp))
+        if (ImGui.SliderInt("##size", ref tileSize, previews ? Config.MinPreviewWidth : Config.MinIconSize,
+                previews ? Config.MaxPreviewWidth : Config.MaxIconSize, "Image size %d", ImGuiSliderFlags.AlwaysClamp))
         {
-            if (screenshots)
-                Plugin.Config.ShotWidth = tileSize;
+            if (previews)
+                Plugin.Config.PreviewWidth = tileSize;
             else
                 Plugin.Config.IconSize = tileSize;
         }
         // Save once the drag ends, not every frame.
         if (ImGui.IsItemDeactivatedAfterEdit())
             Plugin.Config.Save();
-        ImGui.SameLine();
-        ImGui.TextUnformatted(status);
-        // Pinned to the right edge, but never over the status text.
+        // Pinned to the right edge, but never over the slider.
         const string hint = "Right click: copy name, Shift+right click: Search for Item";
         ImGui.SameLine();
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X - ImGui.CalcTextSize(hint).X));
         ImGui.TextDisabled(hint);
 
-        // Colors is a plain button at the right end of the tab row. ImGui's trailing tab buttons follow
-        // the last tab and reach the edge only when the tabs fill the bar.
-        const string colors = "Colors";
-        var colorsWidth = ImGui.CalcTextSize(colors).X + ImGui.GetStyle().FramePadding.X * 2;
-        var row = ImGui.GetCursorPos();
-        ImGui.SetCursorPosX(ImGui.GetWindowContentRegionMax().X - colorsWidth);
-        if (ImGui.Button(colors))
-            colorsWindow.Toggle();
-        ImGui.SetCursorPos(row);
+        DrawControls();
 
         if (picked is { } p && p.Character != Plugin.PlayerState.ContentId)
             picked = null;
         var female = ShowFemale;
 
-        // The tab bar takes its width from the work rect as it begins: narrow it to leave room for the button,
-        // then restore it for the tab contents.
-        var window = ImGuiP.GetCurrentWindow();
-        var reserved = colorsWidth + ImGui.GetStyle().ItemSpacing.X;
-        window.WorkRect.Max.X -= reserved;
         using (var tabBar = ImRaii.TabBar("##slots"))
         {
-            window.WorkRect.Max.X += reserved;
             if (tabBar)
             {
                 foreach (var (label, slot, pack, folders) in Tabs)
@@ -485,25 +487,150 @@ public class MainWindow : Window, IDisposable
             }
         }
 
+        DrawHistory();
         DrawStatusBar(female);
     }
 
-    // One row at the bottom of the window: the list above leaves room for it. On the left, in screenshot mode the packs button,
+    // The row above the status bar, with a small gap under it: what the last action did on the left; on the right, but never
+    // over the text, the revert button, then back and forward through the items put on. The arrows are wider than the other
+    // icon buttons; a wider gap sets the revert button apart from them.
+    private void DrawHistory()
+    {
+        var style = ImGui.GetStyle();
+        ImGui.SetCursorPosY(ImGui.GetWindowContentRegionMax().Y - ImGui.GetFrameHeight() * 2 - style.ItemSpacing.Y * 2);
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted(status);
+
+        const string label = "History:";
+        var button = new Vector2(ImGui.GetFrameHeight() * 2.5f, ImGui.GetFrameHeight());
+        // As far from the right edge as the patch filter below.
+        var width = ImGuiComponents.GetIconButtonWithTextWidth(FontAwesomeIcon.UndoAlt, RevertName) + ImGui.GetFrameHeight()
+            + ImGui.CalcTextSize(label).X + style.ItemSpacing.X + button.X * 2 + style.ItemInnerSpacing.X + ImGui.GetFrameHeight();
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X - width));
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.UndoAlt, RevertName))
+            Revert();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Put the game's own gear back on. The back arrow puts this outfit on again.");
+        ImGui.SameLine(0, ImGui.GetFrameHeight());
+        ImGui.TextUnformatted(label);
+        ImGui.SameLine();
+        foreach (var forward in new[] { false, true })
+        {
+            var name = forward ? history.ForwardName : history.BackName;
+            using (ImRaii.Disabled(name == null))
+            {
+                if (ImGuiComponents.IconButton(forward ? FontAwesomeIcon.ArrowRight : FontAwesomeIcon.ArrowLeft, button))
+                    Travel(forward);
+            }
+            if (name != null && ImGui.IsItemHovered())
+                ImGui.SetTooltip(forward ? $"Redo: {name}" : $"Undo: {name}");
+            if (!forward)
+                ImGui.SameLine(0, style.ItemInnerSpacing.X);
+        }
+    }
+
+    // The row above the tabs: Glamourer's toggles, buttons as the gender switch, lit up when on and grayed out when off.
+    // Ears only for Viera: no other race has the toggle. The race comes from Glamourer's state, as the character looks now:
+    // a race Glamourer has changed doesn't show in the game object's customize. Then the dyes button, set apart from them
+    // by a wider gap. Saving a preset is pinned to the right edge, but never over the rest.
+    private void DrawControls()
+    {
+        // Shared with the dyes window: one read of Glamourer's state for both.
+        pins.RefreshState();
+        var state = pins.State;
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted("Toggles:");
+        ImGui.SameLine();
+        var spacing = ImGui.GetStyle().ItemInnerSpacing.X;
+        // Viera is row 8 of the Race sheet.
+        var viera = (int?)state?["Customize"]?["Race"]?["Value"] == 8;
+        foreach (var (flag, key, field, icon, name) in Toggles)
+        {
+            if (flag == MetaFlag.EarState && !viera)
+                continue;
+
+            var on = (bool?)state?["Equipment"]?[key]?[field];
+            using (ImRaii.Disabled(on == null))
+            using (ImRaii.PushColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive), on == true)
+                .Push(ImGuiCol.Text, ImGui.GetColorU32(ImGuiCol.TextDisabled), on == false))
+            {
+                if (ImGuiComponents.IconButton(icon) && on != null)
+                    SetMeta(flag, name, !on.Value);
+            }
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(on != null ? OnOff(name, on.Value) : pins.StateError.Length > 0 ? $"{name}\n{pins.StateError}" : name);
+            ImGui.SameLine(0, spacing);
+        }
+
+        ImGui.SameLine(0, ImGui.GetFrameHeight());
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Palette, "Manage dyes"))
+            dyesWindow.Toggle();
+
+        const string save = "Save preset to Glamourer";
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(),
+            ImGui.GetWindowContentRegionMax().X - ImGuiComponents.GetIconButtonWithTextWidth(FontAwesomeIcon.Save, save)));
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Save, save))
+        {
+            presetName = $"BetterDresser {DateTime.Now:yyyy-MM-dd HH:mm}";
+            ImGui.OpenPopup("##preset");
+        }
+        DrawPresetPopup();
+    }
+
+    // The name for the new design, filled in and selected: typing replaces it. Enter saves, a click outside closes.
+    private void DrawPresetPopup()
+    {
+        using var popup = ImRaii.Popup("##preset");
+        if (!popup)
+            return;
+
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted("Name:");
+        ImGui.SameLine();
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        ImGui.SetNextItemWidth(300 * ImGuiHelpers.GlobalScale);
+        var enter = ImGui.InputText("##name", ref presetName, 100, ImGuiInputTextFlags.EnterReturnsTrue | ImGuiInputTextFlags.AutoSelectAll);
+        var name = presetName.Trim();
+        ImGui.SameLine();
+        using (ImRaii.Disabled(name.Length == 0))
+        {
+            if ((ImGui.Button("Save") || enter) && name.Length > 0)
+            {
+                SavePreset(name);
+                ImGui.CloseCurrentPopup();
+            }
+        }
+    }
+
+    private static string OnOff(string name, bool on) => $"{name}: {(on ? "on" : "off")}";
+
+    // One row at the bottom of the window: the list above leaves room for it. On the left, in preview mode the packs button,
     // the gender switch and the update notice, then the armoire warning. The patch filter is pinned to the right edge,
     // but never over the rest.
     private void DrawStatusBar(bool female)
     {
         ImGui.SetCursorPosY(ImGui.GetWindowContentRegionMax().Y - ImGui.GetFrameHeight());
         ImGui.AlignTextToFramePadding();
-        if (Plugin.Config.Screenshots)
+        if (Plugin.Config.Previews)
         {
-            if (ImGuiComponents.IconButton(FontAwesomeIcon.Download))
+            if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Download, "Download previews"))
                 packsWindow.Toggle();
+            // A yellow outline, as the other notices are yellow, while there are no previews on disk at all.
+            var none = previewFiles.Values.All(f => f.Count == 0);
+            if (none)
+                ImGui.GetWindowDrawList().AddRect(ImGui.GetItemRectMin(), ImGui.GetItemRectMax(), ImGui.GetColorU32(ImGuiColors.DalamudYellow),
+                    ImGui.GetStyle().FrameRounding, ImDrawFlags.None, 2);
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Screenshot packs: download, update, delete.");
-            ImGui.SameLine();
+                ImGui.SetTooltip(none ? "No previews yet: download the packs here." : "Preview packs: download, update, delete.");
 
-            // Two buttons side by side: the gender shown lit up, the other one grayed out.
+            // Two buttons side by side after their label, set apart from the packs button by a wider gap:
+            // the gender shown lit up, the other one grayed out.
+            ImGui.SameLine(0, ImGui.GetFrameHeight());
+            ImGui.TextUnformatted("Change previews:");
+            ImGui.SameLine();
             foreach (var f in new[] { false, true })
             {
                 using (ImRaii.PushColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive), f == female)
@@ -518,17 +645,9 @@ public class MainWindow : Window, IDisposable
             }
 
             if (packsWindow.UpdateSize > 0)
-            {
-                ImGui.TextColored(ImGuiColors.DalamudYellow, $"Screenshot update: {PacksWindow.FormatSize(packsWindow.UpdateSize)}");
-                if (ImGui.IsItemHovered())
-                {
-                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-                    ImGui.SetTooltip("Click to open the screenshot packs.");
-                }
-                if (ImGui.IsItemClicked())
-                    packsWindow.IsOpen = true;
-                ImGui.SameLine();
-            }
+                DrawPacksNotice($"Preview update: {PacksWindow.FormatSize(packsWindow.UpdateSize)}");
+            if (packsWindow.NewPacks() is { Count: > 0 } added)
+                DrawPacksNotice($"New preview packs: {string.Join(", ", added)}");
         }
 
         // Other sources are cached by the game itself; only the armoire can be missing.
@@ -539,23 +658,7 @@ public class MainWindow : Window, IDisposable
             ImGui.SameLine();
         }
 
-        // Back and forward through the items put on: in the middle of the row, or right after the left side if it reaches past that.
         var style = ImGui.GetStyle();
-        var arrows = IconButtonWidth(FontAwesomeIcon.ArrowLeft) + style.ItemInnerSpacing.X + IconButtonWidth(FontAwesomeIcon.ArrowRight);
-        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), (ImGui.GetWindowContentRegionMin().X + ImGui.GetWindowContentRegionMax().X - arrows) / 2));
-        foreach (var forward in new[] { false, true })
-        {
-            var name = forward ? history.ForwardName : history.BackName;
-            using (ImRaii.Disabled(name == null))
-            {
-                if (ImGuiComponents.IconButton(forward ? FontAwesomeIcon.ArrowRight : FontAwesomeIcon.ArrowLeft))
-                    Travel(forward);
-            }
-            if (name != null && ImGui.IsItemHovered())
-                ImGui.SetTooltip(forward ? $"Redo: {name}" : $"Undo: {name}");
-            ImGui.SameLine(0, forward ? -1 : style.ItemInnerSpacing.X);
-        }
-
         const string label = "Filter by patch:";
         const string all = "All";
         var fontSize = ImGui.GetFontSize();
@@ -591,6 +694,20 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Only items added in this patch or expansion. Items newer than the plugin's patch data show only under All.");
     }
 
+    // Yellow text in the status bar that opens the packs window.
+    private void DrawPacksNotice(string text)
+    {
+        ImGui.TextColored(ImGuiColors.DalamudYellow, text);
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+            ImGui.SetTooltip("Click to open the preview packs.");
+        }
+        if (ImGui.IsItemClicked())
+            packsWindow.IsOpen = true;
+        ImGui.SameLine();
+    }
+
     private void DrawList(ApiEquipSlot slot, string? pack, string[] folders, bool female)
     {
         IEnumerable<Entry> list = items[slot];
@@ -606,6 +723,11 @@ public class MainWindow : Window, IDisposable
         if (Plugin.Config.HideStore)
             list = list.Where(e => !e.Store);
 
+        // With previews, only what the gender shown can wear: an item locked to the other gender is left out.
+        var previews = Plugin.Config.Previews;
+        if (previews)
+            list = list.Where(e => female ? e.Female : e.Male);
+
         // A patch version or an expansion name: they never collide.
         var patch = Plugin.Config.Patch;
         if (patch.Length > 0)
@@ -614,24 +736,30 @@ public class MainWindow : Window, IDisposable
         if (search.Length > 0)
             list = list.Where(e => e.Name.Contains(search, StringComparison.OrdinalIgnoreCase));
 
-        // Leave room for the status bar at the bottom of the window, with a small gap above it.
-        using var child = ImRaii.Child("##list", new Vector2(0, -ImGui.GetFrameHeightWithSpacing() - ImGui.GetStyle().ItemSpacing.Y));
+        // Leave room for the history row and the status bar at the bottom of the window, with a small gap above them.
+        // With previews the wheel is handled below: ImGui's own step is a few lines of text, whatever the size of the tiles.
+        using var child = ImRaii.Child("##list", new Vector2(0, -ImGui.GetFrameHeightWithSpacing() * 2 - ImGui.GetStyle().ItemSpacing.Y * 2),
+            false, previews ? ImGuiWindowFlags.NoScrollWithMouse : ImGuiWindowFlags.None);
         if (!child)
             return;
 
         var entries = list.ToList();
-        var screenshots = Plugin.Config.Screenshots;
         // Every tile in a tab is the same size, so the list can skip the rows out of view.
         var shapePack = pack ?? GenderPack(female);
-        var size = screenshots
-            ? new Vector2(1, ShotAspect(shapePack, ShapeFolder(shapePack, folders, entries))) * Plugin.Config.ShotWidth * ImGuiHelpers.GlobalScale
+        var size = previews
+            ? new Vector2(1, PreviewAspect(shapePack, ShapeFolder(shapePack, folders, entries))) * Plugin.Config.PreviewWidth * ImGuiHelpers.GlobalScale
             : new Vector2(Plugin.Config.IconSize * ImGuiHelpers.GlobalScale);
         // The same gap across and down: the style's vertical item spacing is smaller than the horizontal one.
         var gap = ImGui.GetStyle().ItemSpacing.X;
         using var spacing = ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, new Vector2(gap));
         var columns = Math.Max(1, (int)((ImGui.GetContentRegionAvail().X + gap) / (size.X + gap)));
 
-        ImGuiClip.ClippedDraw(entries, e => DrawTile(slot, e, size, screenshots, screenshots ? ShotOf(pack, folders, e, female) : null),
+        // With previews a notch of the wheel scrolls a quarter of a row of tiles, so the speed keeps up with the tile size.
+        var wheel = ImGui.GetIO().MouseWheel;
+        if (previews && wheel != 0 && ImGui.IsWindowHovered())
+            ImGui.SetScrollY(ImGui.GetScrollY() - wheel * (size.Y + gap) / 4);
+
+        ImGuiClip.ClippedDraw(entries, e => DrawTile(slot, e, size, previews, previews ? PreviewOf(pack, folders, e, female) : null),
             columns, size.Y + gap);
     }
 
@@ -667,10 +795,10 @@ public class MainWindow : Window, IDisposable
         draw.AddText(font, size, at, ImGui.GetColorU32(ImGuiColors.DalamudYellow), text);
     }
 
-    // A gray tile with the screenshot fitted inside and the game icon in the top left corner;
-    // without a screenshot (missing, still loading or icon mode) the icon sits in the middle.
+    // A gray tile with the preview fitted inside and the game icon in the top left corner;
+    // without a preview (missing, still loading or icon mode) the icon sits in the middle.
     // In icon mode the tile is icon-sized, so the icon covers it with no frame around.
-    private void DrawTile(ApiEquipSlot slot, Entry e, Vector2 size, bool screenshots, string? shot)
+    private void DrawTile(ApiEquipSlot slot, Entry e, Vector2 size, bool previews, string? preview)
     {
         using var id = ImRaii.PushId((int)e.Id);
         var min = ImGui.GetCursorScreenPos();
@@ -692,7 +820,7 @@ public class MainWindow : Window, IDisposable
         draw.AddRectFilled(min, max, ImGui.GetColorU32(ImGuiCol.FrameBg));
 
         var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(e.Icon)).GetWrapOrEmpty();
-        if (shot != null && Plugin.TextureProvider.GetFromFile(shot).TryGetWrap(out var image, out _))
+        if (preview != null && Plugin.TextureProvider.GetFromFile(preview).TryGetWrap(out var image, out _))
         {
             var scale = Math.Min(size.X / image.Width, size.Y / image.Height);
             var fit = new Vector2(image.Width, image.Height) * scale;
@@ -708,7 +836,7 @@ public class MainWindow : Window, IDisposable
         }
         else
         {
-            var iconSize = screenshots ? new Vector2(IconSize * ImGuiHelpers.GlobalScale) : size;
+            var iconSize = previews ? new Vector2(IconSize * ImGuiHelpers.GlobalScale) : size;
             var at = min + (size - iconSize) / 2;
             draw.AddImage(icon.Handle, at, at + iconSize);
             DrawDyes(draw, at + new Vector2(iconSize.X, 0), iconSize.X, e.Dyes);
@@ -745,7 +873,7 @@ public class MainWindow : Window, IDisposable
             // Two-part weapons: Glamourer doesn't fill the off hand over IPC, so it is set from the same item as well.
             ApiEquipSlot[] slots = slot == ApiEquipSlot.MainHand && e.ModelSub != 0 ? [slot, ApiEquipSlot.OffHand] : [slot];
             var before = history.Take(slots);
-            List<byte> Dyes(int i) => Plugin.Config.KeepDyes && before != null ? before[i].Stains : [0, 0];
+            List<byte> Dyes(int i) => Plugin.Config.KeepDyesOnGearChange && before != null ? before[i].Stains : [0, 0];
 
             // Shields and tools go as a custom model id: see IdOf.
             var result = pins.Set(slot, Pins.IdOf(slot, e.Id), Dyes(0));
@@ -759,14 +887,92 @@ public class MainWindow : Window, IDisposable
             }
             status = result == GlamourerApiEc.Success ? $"Applied: {e.Name}" : $"Glamourer: {result}";
         }
-        catch (IpcNotReadyError)
+        catch (Exception ex)
         {
-            status = "Glamourer is not available.";
+            status = Pins.ErrorText(ex, "SetItem failed");
+        }
+    }
+
+    // Once, as Glamourer's own toggles: it keeps the value until the same setting is changed in the game.
+    // Not pinned like the gear: Glamourer lets the game override it only when the game's own value changes. Not in the history.
+    private void SetMeta(MetaFlag flag, string name, bool on)
+    {
+        try
+        {
+            var result = setMetaState.Invoke(Plugin.Actor, flag, on, 0, ApplyFlag.Once);
+            status = result == GlamourerApiEc.Success ? OnOff(name, on) : $"Glamourer: {result}";
         }
         catch (Exception ex)
         {
-            status = "Something went wrong, see /xllog.";
-            Plugin.Log.Warning(ex, "SetItem failed");
+            status = Pins.ErrorText(ex, "SetMetaState failed");
+        }
+
+        pins.ReadStateSoon();
+    }
+
+    // The character as it looks now becomes a new Glamourer design, opened in Glamourer. Gear only: the appearance is saved
+    // in it, but not applied, so the preset can go on any character. Glamourer keeps the apply flags it is given.
+    private void SavePreset(string name)
+    {
+        try
+        {
+            var (result, data) = getState.Invoke(Plugin.Actor);
+            if (result != GlamourerApiEc.Success || data == null)
+            {
+                status = $"Glamourer: {result}";
+                return;
+            }
+
+            foreach (var group in new[] { "Customize", "Parameters" })
+                if (data[group] is JObject values)
+                    foreach (var property in values.Properties())
+                        if (property.Value is JObject entry)
+                            entry["Apply"] = false;
+
+            result = addDesign.Invoke(data.ToString(), name, out var id);
+            if (result != GlamourerApiEc.Success)
+            {
+                status = $"Glamourer: {result}";
+                return;
+            }
+
+            // The design is saved by now: failing to open it mustn't read as a failed save, or the user saves it again.
+            try
+            {
+                openDesign.Invoke(id);
+                status = $"Saved: {name}";
+            }
+            catch (Exception ex)
+            {
+                status = $"Saved: {name} (couldn't open Glamourer)";
+                Plugin.Log.Warning(ex, "OpenDesign failed");
+            }
+        }
+        catch (Exception ex)
+        {
+            status = Pins.ErrorText(ex, "Saving a preset failed");
+        }
+    }
+
+    // The gear as the game has it, the appearance left alone. One step in the history for every slot: back puts the outfit on again.
+    private void Revert()
+    {
+        try
+        {
+            var before = history.Take(Slots);
+            var result = revertState.Invoke(Plugin.Actor, 0, ApplyFlag.Equipment);
+            if (result == GlamourerApiEc.Success && before != null)
+                history.Add(RevertName, Slots, before);
+            status = result switch
+            {
+                GlamourerApiEc.Success => "Outfit reset",
+                GlamourerApiEc.NothingDone => "Nothing to reset",
+                _ => $"Glamourer: {result}",
+            };
+        }
+        catch (Exception ex)
+        {
+            status = Pins.ErrorText(ex, "RevertState failed");
         }
     }
 
@@ -778,14 +984,9 @@ public class MainWindow : Window, IDisposable
             var result = forward ? history.Forward() : history.Back();
             status = result != GlamourerApiEc.Success ? $"Glamourer: {result}" : forward ? $"Redone: {name}" : $"Undone: {name}";
         }
-        catch (IpcNotReadyError)
-        {
-            status = "Glamourer is not available.";
-        }
         catch (Exception ex)
         {
-            status = "Something went wrong, see /xllog.";
-            Plugin.Log.Warning(ex, "SetItem failed");
+            status = Pins.ErrorText(ex, "SetItem failed");
         }
     }
 }

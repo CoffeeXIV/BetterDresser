@@ -26,7 +26,8 @@ public sealed class Plugin : IDalamudPlugin
     // The object index Glamourer dresses: the local player, or in GPose the player's GPose copy, which is always at 201.
     internal static int Actor => ClientState.IsGPosing ? 201 : 0;
 
-    // As the character looks now (Glamourer can change it); male with no character.
+    // The gender the game has for the character, male with no character. A change in Glamourer doesn't show in the game object,
+    // and the previews aren't meant to switch on their own.
     internal static bool CharacterFemale => ObjectTable[Actor] is ICharacter c && c.Customize[(int)CustomizeIndex.Gender] == 1;
 
     private static readonly string[] Commands = ["/bdresser", "/betterdresser"];
@@ -40,14 +41,16 @@ public sealed class Plugin : IDalamudPlugin
     {
         Config = PluginInterface.GetPluginConfig() as Config ?? new Config();
         // Sizes saved before the slider clamped typed values, or edited by hand: a size of 0 breaks the grid.
-        Config.ShotWidth = Math.Clamp(Config.ShotWidth, Config.MinShotWidth, Config.MaxShotWidth);
+        Config.PreviewWidth = Math.Clamp(Config.PreviewWidth, Config.MinPreviewWidth, Config.MaxPreviewWidth);
         Config.IconSize = Math.Clamp(Config.IconSize, Config.MinIconSize, Config.MaxIconSize);
         pins = new Pins();
-        var colorsWindow = new ColorsWindow(pins);
+        // One history for both: the catalog's arrows step through gear and dyes alike.
+        var history = new History(pins);
+        var dyesWindow = new DyesWindow(pins, history);
         packsWindow = new PacksWindow();
-        mainWindow = new MainWindow(colorsWindow, packsWindow, pins);
+        mainWindow = new MainWindow(dyesWindow, packsWindow, pins, history);
         windowSystem.AddWindow(mainWindow);
-        windowSystem.AddWindow(colorsWindow);
+        windowSystem.AddWindow(dyesWindow);
         windowSystem.AddWindow(packsWindow);
 
         foreach (var command in Commands)

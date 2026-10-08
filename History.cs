@@ -3,10 +3,10 @@ using Glamourer.Api.Enums;
 
 namespace Dresser;
 
-// Gear put on from the catalog, to step back and forward through. Dyes aren't steps. In memory, per character.
+// Gear put on from the catalog and dyes changed in the dyes window, to step back and forward through. In memory, per character.
 public class History(Pins pins)
 {
-    // One click in the catalog: its slots before and after it. After is taken again on each step back and before on each
+    // One click in the catalog or the dyes window: its slots before and after it. After is taken again on each step back and before on each
     // step forward, so back then forward returns to the same look, dyes changed in between included.
     private record Step(string Name, ApiEquipSlot[] Slots, Look[] Before, Look[] After);
 
@@ -35,19 +35,9 @@ public class History(Pins pins)
     internal string? ForwardName => Current is var line && line.Done < line.Steps.Count ? line.Steps[line.Done].Name : null;
 
     // The slots as they are now, null without a state. Throws when Glamourer is not available.
-    internal Look[]? Take(ApiEquipSlot[] slots)
-    {
-        var looks = new Look[slots.Length];
-        for (var i = 0; i < slots.Length; i++)
-        {
-            if (pins.Get(slots[i]) is not { } look)
-                return null;
-            looks[i] = look;
-        }
-        return looks;
-    }
+    internal Look[]? Take(ApiEquipSlot[] slots) => pins.Get(slots);
 
-    // After putting an item on: a new step in place of the ones stepped back from. After is an array of its own even without
+    // After putting an item on or dyeing: a new step in place of the ones stepped back from. After is an array of its own even without
     // a state to read: a step back keeps the look it leaves there, and in before's array it would overwrite what it goes back to.
     internal void Add(string name, ApiEquipSlot[] slots, Look[] before)
     {
@@ -76,13 +66,15 @@ public class History(Pins pins)
         return result;
     }
 
-    // Keeps what the slots show now in `now`, then puts `to` on them.
+    // Keeps what the slots show now in `now`, all read before any of them changes, then puts `to` on them.
     private GlamourerApiEc Move(ApiEquipSlot[] slots, Look[] now, Look[] to)
     {
+        if (pins.Get(slots) is { } current)
+            current.CopyTo(now, 0);
+
         var result = GlamourerApiEc.Success;
         for (var i = 0; i < slots.Length; i++)
         {
-            now[i] = pins.Get(slots[i]) ?? now[i];
             var set = pins.Set(slots[i], to[i].Id, to[i].Stains);
             if (set != GlamourerApiEc.Success)
                 result = set;

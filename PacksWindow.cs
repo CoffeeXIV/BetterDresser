@@ -6,18 +6,20 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Numerics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 
 namespace Dresser;
 
-// Screenshot packs from GitHub releases of the zips that publish.cs builds. Every release has each pack in full (<pack>.zip) and
+// Preview packs from GitHub releases of the zips that publish.cs builds. Every release has each pack in full (<pack>.zip) and
 // a delta with what changed since the release before (<pack>-delta.zip). A pack is unpacked into shots/<pack>/,
 // with its release tag in shots/<pack>/.version.
 public sealed class PacksWindow : Window, IDisposable
@@ -47,8 +49,8 @@ public sealed class PacksWindow : Window, IDisposable
     // How long a list of releases is reused when the window is opened again.
     private static readonly TimeSpan Fresh = TimeSpan.FromMinutes(5);
 
-    // The only files unpacked: shots as publish.cs packs them, <folder>/<ModelMain>.<jpg|png>.
-    private static readonly Regex Shot = new("^[a-z0-9]+/[0-9]+\\.(jpg|png)$", RegexOptions.IgnoreCase);
+    // The only files unpacked: previews as publish.cs packs them, <folder>/<ModelMain>.<jpg|png>.
+    private static readonly Regex Preview = new("^[a-z0-9]+/[0-9]+\\.(jpg|png)$", RegexOptions.IgnoreCase);
 
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -74,7 +76,10 @@ public sealed class PacksWindow : Window, IDisposable
     // Packs ticked for download; null until set to the defaults once the releases are in.
     private HashSet<string>? selected;
 
-    public PacksWindow() : base("BetterDresser Screenshots", ImGuiWindowFlags.AlwaysAutoResize)
+    // The border color the window's own red one replaces, given back to its contents.
+    private Vector4 border;
+
+    public PacksWindow() : base("BetterDresser Previews", ImGuiWindowFlags.AlwaysAutoResize)
     {
         Refresh();
     }
@@ -83,14 +88,14 @@ public sealed class PacksWindow : Window, IDisposable
     public long UpdateSize { get; private set; }
 
     // Raised after a download or a delete has changed the files under shots/, from a background thread.
-    public event EventHandler? ShotsChanged;
+    public event EventHandler? PreviewsChanged;
 
     public void Dispose()
     {
         cts.Cancel();
         // A job stops at the next file it unpacks. It is let finish with shots/ first: a reloaded plugin could start on the same folders.
         if (!task.Wait(TimeSpan.FromSeconds(10)))
-            Plugin.Log.Warning("A screenshot download is still running as the plugin unloads");
+            Plugin.Log.Warning("A preview download is still running as the plugin unloads");
         http.Dispose();
     }
 
@@ -116,6 +121,21 @@ public sealed class PacksWindow : Window, IDisposable
             return;
         }
         Refresh();
+    }
+
+    // A thicker border in the title's color, so the window stands out. The window draws it as it begins, so it is pushed here
+    // and popped in PostDraw: Dalamud pushes the title colors in between, a pop in Draw would take one of those.
+    // Opens in the middle of the screen, and is left where the user puts it after that: a list that comes in later grows it
+    // from where it stands.
+    public override void PreDraw()
+    {
+        var colors = ImGui.GetStyle().Colors;
+        border = colors[(int)ImGuiCol.Border];
+        ImGui.PushStyleColor(ImGuiCol.Border, colors[(int)ImGuiCol.TitleBgActive]);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 3 * ImGuiHelpers.GlobalScale);
+
+        var viewport = ImGui.GetMainViewport();
+        ImGui.SetNextWindowPos(viewport.Pos + viewport.Size / 2, ImGuiCond.Appearing, new Vector2(0.5f));
     }
 
     private void Refresh()
@@ -147,7 +167,7 @@ public sealed class PacksWindow : Window, IDisposable
             catch (Exception ex)
             {
                 error = $"Can't reach GitHub: {ex.Message}";
-                Plugin.Log.Warning(ex, "Can't list the screenshot releases");
+                Plugin.Log.Warning(ex, "Can't list the preview releases");
             }
             LoadInstalled();
             selected = null;
@@ -161,7 +181,7 @@ public sealed class PacksWindow : Window, IDisposable
         var tags = new Dictionary<string, string>();
         foreach (var (pack, _) in Packs)
         {
-            var file = Path.Combine(MainWindow.ShotsRoot, pack, ".version");
+            var file = Path.Combine(MainWindow.PreviewsRoot, pack, ".version");
             try
             {
                 if (File.Exists(file))
@@ -179,6 +199,23 @@ public sealed class PacksWindow : Window, IDisposable
     }
 
     private bool Offered(string pack) => releases.Count > 0 && releases[0].Assets.Any(a => a.Name == $"{pack}.zip");
+
+    // Labels of the packs offered that aren't installed and have come out since the packs were last listed in this window:
+    // shown in the main window's status bar. The first list ever loaded only sets what is known, so packs out before the notice
+    // existed, or a gender's pack left out on purpose, never count as new.
+    internal List<string> NewPacks()
+    {
+        var offered = Packs.Where(p => Offered(p.Pack)).ToList();
+        if (offered.Count == 0)
+            return [];
+
+        if (Plugin.Config.KnownPacks == null)
+        {
+            Plugin.Config.KnownPacks = offered.Select(p => p.Pack).ToHashSet();
+            Plugin.Config.Save();
+        }
+        return offered.Where(p => !installed.ContainsKey(p.Pack) && !Plugin.Config.KnownPacks.Contains(p.Pack)).Select(p => p.Label).ToList();
+    }
 
     // Downloads that bring an offered pack to the newest release: the delta of each release since the installed one,
     // oldest first, or the full pack if it isn't installed, its release is gone, a release since has no delta for it,
@@ -204,9 +241,18 @@ public sealed class PacksWindow : Window, IDisposable
         ? PlanFor(pack).Count > 0
         : pack is "accessories" or "weapons" || pack == MainWindow.GenderPack(Plugin.CharacterFemale);
 
+    // Called after PreDraw even when the window is collapsed.
+    public override void PostDraw()
+    {
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor();
+    }
+
     public override void Draw()
     {
-        ImGui.TextUnformatted("Pictures of the gear for the Screenshots mode, downloaded from GitHub.");
+        // The red is for the window's own border only, not for tooltips and frames inside it.
+        using var color = ImRaii.PushColor(ImGuiCol.Border, border);
+        ImGui.TextUnformatted("Pictures of the gear for the Previews mode, downloaded from GitHub.");
         ImGui.TextDisabled("Game patches bring updates: the status bar of the main window tells when.");
         ImGui.Separator();
 
@@ -229,6 +275,13 @@ public sealed class PacksWindow : Window, IDisposable
             ImGui.TextUnformatted("No packs published yet.");
             return;
         }
+
+        // The packs listed here are seen: none of them is new for the main window's status bar any more.
+        var known = Plugin.Config.KnownPacks ??= [];
+        var count = known.Count;
+        known.UnionWith(offered.Select(p => p.Pack));
+        if (known.Count != count)
+            Plugin.Config.Save();
 
         selected ??= offered.Select(p => p.Pack).Where(Suggested).ToHashSet();
         using (var table = ImRaii.Table("##packs", 4, ImGuiTableFlags.SizingFixedFit))
@@ -298,7 +351,7 @@ public sealed class PacksWindow : Window, IDisposable
     private string Version(string tag) => releases.Any(r => r.TagName == tag && r.Prerelease) ? $"{tag} (test)" : tag;
 
     // One job at a time, off the game thread. The download folder is cleared after it, failed or not, and the tags reread;
-    // the main window is told to rescan the shots.
+    // the main window is told to rescan the previews.
     private void Run(Func<Task> job)
     {
         running = true;
@@ -321,7 +374,7 @@ public sealed class PacksWindow : Window, IDisposable
                     Plugin.Log.Warning(ex, $"Can't clear {Staging}");
                 }
                 LoadInstalled();
-                ShotsChanged?.Invoke(this, EventArgs.Empty);
+                PreviewsChanged?.Invoke(this, EventArgs.Empty);
                 running = false;
             }
         });
@@ -339,7 +392,7 @@ public sealed class PacksWindow : Window, IDisposable
             catch (Exception ex)
             {
                 progress[pack] = "Failed, see /xllog";
-                Plugin.Log.Warning(ex, $"Can't install the {pack} screenshots");
+                Plugin.Log.Warning(ex, $"Can't install the {pack} previews");
             }
         }
     });
@@ -354,7 +407,7 @@ public sealed class PacksWindow : Window, IDisposable
         catch (Exception ex)
         {
             progress[pack] = "Failed, see /xllog";
-            Plugin.Log.Warning(ex, $"Can't delete the {pack} screenshots");
+            Plugin.Log.Warning(ex, $"Can't delete the {pack} previews");
         }
         return Task.CompletedTask;
     });
@@ -363,10 +416,10 @@ public sealed class PacksWindow : Window, IDisposable
     // The tag is written after each step, so an interrupted update carries on from there next time.
     private async Task Install(string pack, List<(string Tag, Asset Asset)> plan)
     {
-        var dir = Path.Combine(MainWindow.ShotsRoot, pack);
+        var dir = Path.Combine(MainWindow.PreviewsRoot, pack);
         Directory.CreateDirectory(Staging);
         // A full pack is moved into it, which needs it there: it may have been removed by hand since the plugin started.
-        Directory.CreateDirectory(MainWindow.ShotsRoot);
+        Directory.CreateDirectory(MainWindow.PreviewsRoot);
         for (var i = 0; i < plan.Count; i++)
         {
             var (tag, asset) = plan[i];
@@ -407,7 +460,7 @@ public sealed class PacksWindow : Window, IDisposable
     // It goes into the download folder, cleared after the job. Null if the pack isn't there.
     private static string? MoveAside(string pack)
     {
-        var dir = Path.Combine(MainWindow.ShotsRoot, pack);
+        var dir = Path.Combine(MainWindow.PreviewsRoot, pack);
         if (!Directory.Exists(dir))
             return null;
         var old = Path.Combine(Staging, $"{pack}.old");
@@ -418,7 +471,7 @@ public sealed class PacksWindow : Window, IDisposable
         return old;
     }
 
-    // Only the shots, and no more of them in all than the zip itself weighs: publish.cs stores them uncompressed.
+    // Only the previews, and no more of them in all than the zip itself weighs: publish.cs stores them uncompressed.
     // So a broken or tampered zip can't fill the disk or put other files in. Unpacking stops at the next file once cancelled.
     private void Extract(string zip, string dir)
     {
@@ -427,7 +480,7 @@ public sealed class PacksWindow : Window, IDisposable
         foreach (var entry in archive.Entries)
         {
             cts.Token.ThrowIfCancellationRequested();
-            if (!Shot.IsMatch(entry.FullName))
+            if (!Preview.IsMatch(entry.FullName))
                 continue;
             // A file is never unpacked past the length the zip gives it.
             left -= entry.Length;
