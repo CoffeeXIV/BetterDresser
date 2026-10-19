@@ -123,10 +123,8 @@ public sealed class PacksWindow : Window, IDisposable
         Refresh();
     }
 
-    // A thicker border in the title's color, so the window stands out. The window draws it as it begins, so it is pushed here
-    // and popped in PostDraw: Dalamud pushes the title colors in between, a pop in Draw would take one of those.
-    // Opens in the middle of the screen, and is left where the user puts it after that: a list that comes in later grows it
-    // from where it stands.
+    // A thicker border in the title's color, to stand out: pushed here and popped in PostDraw, since the window draws it as it
+    // begins and Dalamud pushes the title colors in between. Opens centered, then stays where the user puts it.
     public override void PreDraw()
     {
         var colors = ImGui.GetStyle().Colors;
@@ -200,9 +198,8 @@ public sealed class PacksWindow : Window, IDisposable
 
     private bool Offered(string pack) => releases.Count > 0 && releases[0].Assets.Any(a => a.Name == $"{pack}.zip");
 
-    // Labels of the packs offered that aren't installed and have come out since the packs were last listed in this window:
-    // shown in the main window's status bar. The first list ever loaded only sets what is known, so packs out before the notice
-    // existed, or a gender's pack left out on purpose, never count as new.
+    // Packs offered, not installed and out since this window last listed them, for the main window's status bar. The first
+    // list ever only sets what is known: older packs, or a gender's pack left out on purpose, never count as new.
     internal List<string> NewPacks()
     {
         var offered = Packs.Where(p => Offered(p.Pack)).ToList();

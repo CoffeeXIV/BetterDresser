@@ -125,8 +125,8 @@ public class DyesWindow : Window
             using var pushId = ImRaii.PushId((int)row.Slot);
             var min = ImGui.GetCursorScreenPos();
             var right = min.X + ImGui.GetContentRegionAvail().X;
-            // Clear is pinned to the right edge, copy and paste before it, the dye squares before them. Every name ends at the same
-            // place, with room for two dyes, cut short with an ellipsis: an item that takes no dyes has no squares or buttons.
+            // Right to left: clear, copy and paste, the dye squares. Names end at one place, with room for two dyes, cut short
+            // with an ellipsis; an item that takes no dyes has no squares or buttons.
             var clearLeft = right - button;
             var copyLeft = clearLeft - gap - 2 * button - spacing;
             var dyesLeft = copyLeft - gap - row.Item.DyeCount * (button + spacing) + spacing;
@@ -157,8 +157,7 @@ public class DyesWindow : Window
             ImGui.Dummy(new Vector2(right - min.X, icon));
         }
 
-        // A gap below the items, then the buttons for all of them, pinned to the right edge under the rows' buttons:
-        // the copied dyes on every item worn that takes dyes, and no dyes on any of them, each as one step.
+        // Below the items, on the right: paste to all and clear all, each one step.
         ImGui.Dummy(new Vector2(0, ImGui.GetFrameHeight()));
         const string pasteAll = "Paste to all", clearAll = "Clear all";
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X
@@ -292,7 +291,6 @@ public class DyesWindow : Window
             ImGui.OpenPopup("##palette");
         }
         var hovered = ImGui.IsItemHovered();
-        // A right click takes this dye off.
         if (ImGui.IsItemClicked(ImGuiMouseButton.Right) && current != 0)
             ClearDye(row, channel);
 
@@ -379,9 +377,8 @@ public class DyesWindow : Window
         Apply("Cleared dye", $"No dye on {row.Name}", [(row.Slot, row.GlamourId, stains)]);
     }
 
-    // Glamourer has no IPC for dyes alone: the same items go back on with the new dyes, only in their slots.
-    // All of them are one step in the history, named for the main window's arrows; done goes to the status below the items.
-    // A step even if some slot was refused: back undoes the ones that went on.
+    // Glamourer has no IPC for dyes alone: the same items go back on with the new dyes, in their slots only. One history
+    // step, name, even if some slot was refused (back undoes those that went on); done is the status below the items.
     private void Apply(string done, string name, (ApiEquipSlot Slot, ulong Id, List<byte> Stains)[] changes)
     {
         if (changes.Length == 0)

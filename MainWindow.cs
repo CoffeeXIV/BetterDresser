@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -32,17 +33,18 @@ public class MainWindow : Window, IDisposable
 
     // The game icon on preview tiles; icon mode takes Config.IconSize.
     private const float IconSize = 48;
+    // The magnifier over a preview with Alt held: its side, and how many times it zooms the preview as shown.
+    private const float LensSize = 220, LensZoom = 1.7f;
 
     private const string MalePack = "male", FemalePack = "female";
 
-    // Previews are in shots/<pack>/<folder>/, as DresserPhoto writes them. Pack null: male or female by the gender shown.
-    // Both ring tabs share one folder. Weapons are shot sheathed, in back or waist by the job: a model is in one of them,
-    // shields are in back.
+    // Previews are in shots/<pack>/<folder>/. Pack null: male or female by the gender shown.
+    // Both ring tabs share one folder. Weapon tabs have none: they take every folder of the pack (WeaponFolders).
     // Packs are offered for download in PacksWindow.
     private static readonly (string Label, ApiEquipSlot Slot, string? Pack, string[] Folders)[] Tabs =
     [
-        ("Main Hand", ApiEquipSlot.MainHand, "weapons", ["back", "waist"]),
-        ("Off Hand", ApiEquipSlot.OffHand, "weapons", ["back"]),
+        ("Main Hand", ApiEquipSlot.MainHand, "weapons", []),
+        ("Off Hand", ApiEquipSlot.OffHand, "weapons", []),
         ("Head", ApiEquipSlot.Head, null, ["head"]),
         ("Body", ApiEquipSlot.Body, null, ["body"]),
         ("Hands", ApiEquipSlot.Hands, null, ["hands"]),
@@ -67,6 +69,7 @@ public class MainWindow : Window, IDisposable
         (MetaFlag.HatState, "Hat", "Show", FontAwesomeIcon.HatCowboy, "Headgear"),
         (MetaFlag.VisorState, "Visor", "IsToggled", FontAwesomeIcon.Glasses, "Visor"),
         (MetaFlag.EarState, "VieraEars", "Show", FontAwesomeIcon.Deaf, "Viera ears"),
+        (MetaFlag.WeaponState, "Weapon", "Show", FontAwesomeIcon.Gun, "Weapon"),
     ];
 
     private static readonly GameInventoryType[] Containers =
@@ -81,8 +84,13 @@ public class MainWindow : Window, IDisposable
     private readonly Dictionary<ApiEquipSlot, List<Entry>> items = Tabs.ToDictionary(t => t.Slot, _ => new List<Entry>());
     // Preview files on disk per pack and folder: ModelMain -> path.
     private readonly Dictionary<(string Pack, string Folder), Dictionary<ulong, string>> previewFiles = [];
-    // Height to width of the previews per pack and folder, from the first one loaded.
+    // Height to width of the previews per pack and folder, from the first one readable.
     private readonly Dictionary<(string Pack, string Folder), float> aspects = [];
+    // Weapon tabs' folders for the current job, its own first (WeaponFolders). Cleared on a rescan and a job change.
+    private readonly Dictionary<ApiEquipSlot, string[]> weaponFolders = [];
+    // Whether a model has a VFX, per model and slot, read as tiles first show them. The game's gimmick parameters, read once.
+    private readonly Dictionary<(ulong Model, ApiEquipSlot Slot), bool> vfx = [];
+    private byte[]? gimmicks;
     private readonly FileSystemWatcher watcher;
     // When files under shots/ last changed, 0 once rescanned. Set on the watcher's thread and after downloads.
     private long previewsChangedAt;
@@ -106,12 +114,17 @@ public class MainWindow : Window, IDisposable
     private uint cachedJob = uint.MaxValue;
     private HashSet<uint> jobCategories = [];
     private readonly HashSet<uint> owned = [];
-    private long ownedAt;
+    private long ownedAt, armoireAt;
     // Gender picked with the button in the status bar, for that character only: not saved, dropped on switching characters.
     private (ulong Character, bool Female)? picked;
+    // Asked about in DrawChoice.
+    private (List<Entry> Items, bool Search)? choice;
+    private bool openChoice;
+    // The tiles of the tab shown, and what they were made of (DrawList).
+    private (ApiEquipSlot Slot, uint Job, long OwnedAt, bool HideStore, string Patch, string Search) tilesKey;
+    private List<List<Entry>> tiles = [];
 
-    // Not scrolled by the wheel itself: everything fits in it, and with previews the list passes the wheel on to it
-    // (NoScrollWithMouse), so an overflow would scroll the whole window along with the list.
+    // No wheel scrolling: with previews the list passes the wheel on, so an overflow would scroll the window with it.
     public MainWindow(DyesWindow dyesWindow, PacksWindow packsWindow, Pins pins, History history)
         : base("BetterDresser", ImGuiWindowFlags.NoScrollWithMouse)
     {
@@ -123,10 +136,11 @@ public class MainWindow : Window, IDisposable
         LoadItems();
         LoadPreviews();
 
-        // Files copied in or removed show up on their own. Too many changes at once overflow the watcher (Error): rescan all the same.
+        // Any change under shots/ means a rescan: files copied in, over (maybe another shape) or removed, and an overflow (Error).
         Directory.CreateDirectory(PreviewsRoot);
         watcher = new FileSystemWatcher(PreviewsRoot) { IncludeSubdirectories = true };
         watcher.Created += OnPreviewsChanged;
+        watcher.Changed += OnPreviewsChanged;
         watcher.Deleted += OnPreviewsChanged;
         watcher.Renamed += OnPreviewsChanged;
         watcher.Error += OnPreviewsChanged;
@@ -163,13 +177,14 @@ public class MainWindow : Window, IDisposable
 
     private void OnPreviewsChanged(object? sender, EventArgs e) => previewsChangedAt = Environment.TickCount64;
 
-    // Same layout as DresserPhoto writes: shots/<pack>/<folder>/<ModelMain>.<jpg|png>.
+    // The layout of the packs: shots/<pack>/<folder>/<ModelMain>.<jpg|png>.
     // About 10-20 ms for three full packs (23 000 files), fine to do in a frame now and then.
     private void LoadPreviews()
     {
         previewsChangedAt = 0;
         previewFiles.Clear();
         aspects.Clear();
+        weaponFolders.Clear();
         var root = PreviewsRoot;
         if (!Directory.Exists(root))
             return;
@@ -203,30 +218,134 @@ public class MainWindow : Window, IDisposable
 
     internal static string GenderPack(bool female) => female ? FemalePack : MalePack;
 
-    // DresserPhoto crops all previews of a folder with one frame, so any one of them gives the tile shape. 1:2 until one has loaded.
+    // A folder's previews share one frame: the first readable file gives the tile shape, 1:2 if none until the next scan.
+    // Read from the file, not the texture: Dalamud caches textures by path, so a replaced file would keep its old shape.
     private float PreviewAspect(string pack, string folder)
     {
         if (aspects.TryGetValue((pack, folder), out var aspect))
             return aspect;
-        if (!previewFiles.TryGetValue((pack, folder), out var files) || files.Count == 0
-            || !Plugin.TextureProvider.GetFromFile(files.Values.First()).TryGetWrap(out var image, out _))
-            return 2;
-        return aspects[(pack, folder)] = (float)image.Height / image.Width;
+        aspect = 2;
+        if (previewFiles.TryGetValue((pack, folder), out var files))
+            foreach (var path in files.Values)
+                if (ImageSize(path) is { X: > 0, Y: > 0 } size)
+                {
+                    aspect = size.Y / size.X;
+                    break;
+                }
+        return aspects[(pack, folder)] = aspect;
     }
 
-    // The folder whose previews give the tab's tile shape. A job's weapons all hang in one place,
-    // so it is the first folder with any of the list in it.
-    private string ShapeFolder(string pack, string[] folders, List<Entry> list) =>
-        folders.Length == 1 ? folders[0]
-            : folders.FirstOrDefault(f => previewFiles.TryGetValue((pack, f), out var files) && list.Any(e => files.ContainsKey(e.ModelMain))) ?? folders[0];
+    // Parts of an IMC file in its order: armor shares one file for five slots, and so do accessories.
+    private static readonly ApiEquipSlot[] ArmorParts =
+        [ApiEquipSlot.Head, ApiEquipSlot.Body, ApiEquipSlot.Hands, ApiEquipSlot.Legs, ApiEquipSlot.Feet];
+    private static readonly ApiEquipSlot[] AccessoryParts =
+        [ApiEquipSlot.Ears, ApiEquipSlot.Neck, ApiEquipSlot.Wrists, ApiEquipSlot.RFinger, ApiEquipSlot.LFinger];
 
-    // Gendered tabs: the pack of the gender shown, which can wear every item listed. Of several folders the model is in one:
-    // the first that has it.
-    private string? PreviewOf(string? pack, string[] folders, Entry e, bool female)
+    // A VFX on the model (relic auras, fire): the VfxId of the variant's entry in its IMC file, which holds a variant count,
+    // a part mask, then 6 bytes per part per variant, default first. Read lazily: all weapons at once take half a second.
+    private bool HasVfx(ApiEquipSlot slot, ulong model)
+    {
+        if (vfx.TryGetValue((model, slot), out var has))
+            return has;
+
+        var set = model & 0xFFFF;
+        var weapon = slot is ApiEquipSlot.MainHand or ApiEquipSlot.OffHand;
+        var body = model >> 16 & 0xFFFF;
+        var armor = Array.IndexOf(ArmorParts, slot);
+        var path = weapon ? $"chara/weapon/w{set:D4}/obj/body/b{body:D4}/b{body:D4}.imc"
+            : armor >= 0 ? $"chara/equipment/e{set:D4}/e{set:D4}.imc"
+            : $"chara/accessory/a{set:D4}/a{set:D4}.imc";
+        var variant = (int)(weapon ? model >> 32 & 0xFFFF : model >> 16 & 0xFF);
+        var part = weapon ? 0 : armor >= 0 ? armor : Array.IndexOf(AccessoryParts, slot);
+
+        has = false;
+        if (Plugin.DataManager.GetFile(path)?.Data is { Length: >= 4 } data)
+        {
+            var parts = BitOperations.PopCount(BitConverter.ToUInt16(data, 2));
+            var offset = 4 + (variant * parts + part) * 6;
+            has = variant <= BitConverter.ToUInt16(data, 0) && part < parts && offset + 6 <= data.Length && data[offset + 4] != 0;
+        }
+        return vfx[(model, slot)] = has;
+    }
+
+    // Headgear whose visor can be toggled: bit 0 of its model's entry in gimmickparameter.gmp (Penumbra's Visor/Gimmick edits).
+    // Laid out as the EQP: blocks of 160 entries of 8 bytes, only the blocks in use; the first entry is the mask of them.
+    private bool HasVisor(ulong model)
+    {
+        gimmicks ??= Plugin.DataManager.GetFile("chara/xls/equipmentparameter/gimmickparameter.gmp")?.Data ?? [];
+        if (gimmicks.Length < 8)
+            return false;
+
+        var id = (int)(model & 0xFFFF);
+        var block = id / 160;
+        var mask = BitConverter.ToUInt64(gimmicks, 0);
+        if (id == 0 || block >= 64 || (mask >> block & 1) == 0)
+            return false;
+        var offset = (BitOperations.PopCount(mask & ((1ul << block) - 1)) * 160 + id % 160) * 8;
+        return offset + 8 <= gimmicks.Length && (gimmicks[offset] & 1) != 0;
+    }
+
+    private static ReadOnlySpan<byte> PngSignature => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    // Width and height from the header of a JPEG or PNG, null if it can't be read. A few small reads, so fine in a frame:
+    // it is done once per folder after a scan.
+    private static Vector2? ImageSize(string path)
+    {
+        try
+        {
+            using var file = File.OpenRead(path);
+            Span<byte> b = stackalloc byte[24];
+            file.ReadExactly(b);
+            // PNG: the IHDR chunk comes first, its width and height right after its name.
+            if (b[..8].SequenceEqual(PngSignature))
+                return new Vector2(BinaryPrimitives.ReadUInt32BigEndian(b[16..]), BinaryPrimitives.ReadUInt32BigEndian(b[20..]));
+            if (b[0] != 0xFF || b[1] != 0xD8)
+                return null;
+
+            // JPEG: segment by segment up to the start of frame, which has the height and then the width.
+            // DHT, JPG and DAC share the range of the start of frame markers.
+            file.Position = 2;
+            while (true)
+            {
+                file.ReadExactly(b[..4]);
+                var length = BinaryPrimitives.ReadUInt16BigEndian(b[2..]);
+                if (b[0] != 0xFF || length < 2)
+                    return null;
+                if (b[1] is >= 0xC0 and <= 0xCF and not 0xC4 and not 0xC8 and not 0xCC)
+                {
+                    file.ReadExactly(b[..5]);
+                    return new Vector2(BinaryPrimitives.ReadUInt16BigEndian(b[3..]), BinaryPrimitives.ReadUInt16BigEndian(b[1..]));
+                }
+                file.Position += length - 2;
+            }
+        }
+        // Cut short, gone or being written: the end of the file comes up as EndOfStreamException, an IOException.
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    // Weapons and primary tools are shot into a folder per job, shared ones (ACN books, shields) into each job's. The job's
+    // own folder, with most of its items, goes first: it gives the tile shape and is looked in first. Counted once per job
+    // and rescan. No folders: [""], so the tab still has a shape.
+    private string[] WeaponFolders(ApiEquipSlot slot, string pack, IEnumerable<Entry> list)
+    {
+        if (weaponFolders.TryGetValue(slot, out var folders))
+            return folders;
+
+        var models = list.Select(e => e.ModelMain).ToHashSet();
+        folders = previewFiles.Where(p => p.Key.Pack == pack).OrderByDescending(p => p.Value.Keys.Count(models.Contains))
+            .Select(p => p.Key.Folder).ToArray();
+        return weaponFolders[slot] = folders.Length > 0 ? folders : [""];
+    }
+
+    // Gendered tabs: the pack of the gender given. Of several folders (weapons), the first that has the model.
+    private string? PreviewOf(string? pack, string[] folders, ulong model, bool female)
     {
         pack ??= GenderPack(female);
         foreach (var folder in folders)
-            if (previewFiles.TryGetValue((pack, folder), out var files) && files.TryGetValue(e.ModelMain, out var path))
+            if (previewFiles.TryGetValue((pack, folder), out var files) && files.TryGetValue(model, out var path))
                 return path;
         return null;
     }
@@ -250,7 +369,10 @@ public class MainWindow : Window, IDisposable
             if (SlotOf(item.EquipSlotCategory.Value) is { } slot)
             {
                 var race = item.EquipRestriction.Value;
-                items[slot].Add(new Entry(item.RowId, name, item.ClassJobCategory.RowId, item.Icon, item.ModelMain, item.ModelSub, item.DyeCount,
+                // Main hand: a second part only for items that take both hands (two-part weapons). Primary tools have
+                // a ModelSub too, but leave the off hand to the secondary tool, and Glamourer has no off-hand item for it.
+                var sub = slot == ApiEquipSlot.MainHand && item.EquipSlotCategory.Value.OffHand != -1 ? 0 : item.ModelSub;
+                items[slot].Add(new Entry(item.RowId, name, item.ClassJobCategory.RowId, item.Icon, item.ModelMain, sub, item.DyeCount,
                     store.Contains(item.RowId), added.GetValueOrDefault(item.RowId), race.Male, race.Female));
             }
         }
@@ -306,6 +428,7 @@ public class MainWindow : Window, IDisposable
             return;
 
         cachedJob = job;
+        weaponFolders.Clear();
         var column = (int)job + 1;
         var sheet = Plugin.DataManager.Excel.GetSheet<RawRow>(null, "ClassJobCategory");
         jobCategories = column < sheet.Columns.Count
@@ -313,9 +436,8 @@ public class MainWindow : Window, IDisposable
             : [];
     }
 
-    // Bags, armory and equipped gear are read live. Retainers, saddlebags and dresser come from the game's
-    // own "Search for Item" cache: it is saved per character and filled once each of them has been opened.
-    // The armoire isn't in that cache, so it is kept in Config.
+    // Bags, armory and equipped gear live; retainers, saddlebags and the dresser from the game's "Search for Item" cache,
+    // saved per character once each has been opened. The armoire isn't in it: it is kept in Config (SaveArmoire).
     private unsafe void LoadOwned()
     {
         owned.Clear();
@@ -323,7 +445,8 @@ public class MainWindow : Window, IDisposable
             foreach (var item in Plugin.GameInventory.GetInventoryItems(type))
                 owned.Add(item.BaseItemId);
 
-        LoadArmoire();
+        if (Plugin.Config.Armoire.TryGetValue(Plugin.PlayerState.ContentId, out var armoire))
+            owned.UnionWith(armoire);
 
         var finder = ItemFinderModule.Instance();
         if (finder == null)
@@ -364,29 +487,23 @@ public class MainWindow : Window, IDisposable
 
     // The game fetches the armoire from the server only when it is opened at an inn,
     // so the last contents seen are saved per character. A switch to another character drops it in the game.
-    private unsafe void LoadArmoire()
+    private static unsafe void SaveArmoire()
     {
         var character = Plugin.PlayerState.ContentId;
-        if (character == 0)
+        var cabinet = &UIState.Instance()->Cabinet;
+        if (character == 0 || !cabinet->IsCabinetLoaded())
             return;
 
-        var cabinet = &UIState.Instance()->Cabinet;
-        if (cabinet->IsCabinetLoaded())
+        var armoire = new HashSet<uint>();
+        foreach (var row in Plugin.DataManager.GetExcelSheet<Cabinet>())
+            if (cabinet->IsItemInCabinet(row.RowId))
+                armoire.Add(row.Item.RowId);
+
+        if (!Plugin.Config.Armoire.TryGetValue(character, out var saved) || !saved.SetEquals(armoire))
         {
-            var armoire = new HashSet<uint>();
-            foreach (var row in Plugin.DataManager.GetExcelSheet<Cabinet>())
-                if (cabinet->IsItemInCabinet(row.RowId))
-                    armoire.Add(row.Item.RowId);
-
-            if (!Plugin.Config.Armoire.TryGetValue(character, out var saved) || !saved.SetEquals(armoire))
-            {
-                Plugin.Config.Armoire[character] = armoire;
-                Plugin.Config.Save();
-            }
+            Plugin.Config.Armoire[character] = armoire;
+            Plugin.Config.Save();
         }
-
-        if (Plugin.Config.Armoire.TryGetValue(character, out var items))
-            owned.UnionWith(items);
     }
 
     private void AddOwned(Span<uint> ids)
@@ -398,6 +515,16 @@ public class MainWindow : Window, IDisposable
     // Cached ids keep the quality offset: HQ is +1,000,000, collectable +500,000.
     private static uint BaseItemId(uint id) => id % 500_000;
 
+    // A Font Awesome icon centered in a box on whole pixels: across by its ink (Dalamud's icon buttons sit it left of center),
+    // down as a line of text (by its ink it looks high beside a field's text).
+    private static unsafe void DrawIconCentered(ImDrawListPtr draw, FontAwesomeIcon icon, Vector2 min, Vector2 max, uint color)
+    {
+        var font = UiBuilder.IconFont;
+        var glyph = font.FindGlyph(icon.ToIconChar());
+        var at = new Vector2(min.X + max.X - glyph->X0 - glyph->X1, min.Y + max.Y - font.FontSize) / 2;
+        draw.AddText(font, font.FontSize, new Vector2(MathF.Round(at.X), MathF.Round(at.Y)), color, icon.ToIconString());
+    }
+
     private static float CheckboxWidth(string label) =>
         ImGui.GetFrameHeight() + ImGui.GetStyle().ItemInnerSpacing.X + ImGui.CalcTextSize(label).X;
 
@@ -406,8 +533,25 @@ public class MainWindow : Window, IDisposable
         const string storeToggle = "Hide store";
         const string ownedToggle = "Owned";
         const string toggle = "Previews";
-        ImGui.SetNextItemWidth(-CheckboxWidth(storeToggle) - CheckboxWidth(ownedToggle) - CheckboxWidth(toggle) - ImGui.GetStyle().ItemSpacing.X * 3);
+        // A square clear button flush with the search and in the field's colors, so the two read as one field. Nothing to clear:
+        // the cross grayed out, no hover. Not Disabled, which would fade its background apart from the field's.
+        var clear = ImGui.GetFrameHeight();
+        ImGui.SetNextItemWidth(-clear - CheckboxWidth(storeToggle) - CheckboxWidth(ownedToggle) - CheckboxWidth(toggle)
+            - ImGui.GetStyle().ItemSpacing.X * 3);
         ImGui.InputTextWithHint("##search", "Search", ref search, 100);
+        ImGui.SameLine(0, 0);
+        var empty = search.Length == 0;
+        using (ImRaii.PushColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.FrameBg))
+            .Push(ImGuiCol.ButtonHovered, ImGui.GetColorU32(empty ? ImGuiCol.FrameBg : ImGuiCol.FrameBgHovered))
+            .Push(ImGuiCol.ButtonActive, ImGui.GetColorU32(empty ? ImGuiCol.FrameBg : ImGuiCol.FrameBgActive)))
+        {
+            if (ImGui.Button("##clear", new Vector2(clear)))
+                search = string.Empty;
+        }
+        DrawIconCentered(ImGui.GetWindowDrawList(), FontAwesomeIcon.Times, ImGui.GetItemRectMin(), ImGui.GetItemRectMax(),
+            ImGui.GetColorU32(empty ? ImGuiCol.TextDisabled : ImGuiCol.Text));
+        if (!empty && ImGui.IsItemHovered())
+            ImGui.SetTooltip("Clear search");
         ImGui.SameLine();
         var hideStore = Plugin.Config.HideStore;
         if (ImGui.Checkbox(storeToggle, ref hideStore))
@@ -426,8 +570,14 @@ public class MainWindow : Window, IDisposable
             Plugin.Config.Save();
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Only items this character has. The armoire shows up after you open it once at an inn.");
-        // Rebuild at most once a second: cheap, and picks up a retainer or the dresser visited while the window is open.
+            ImGui.SetTooltip("Only items this character has. The armoire item list is synced with BetterDresser if you open the plugin any time after opening the armoire, before logging out.");
+        // Once a second, cheap. The armoire is saved with the filter off too: it may go on later, away from the inn.
+        // With it on, the list is rebuilt and picks up a retainer or the dresser visited while the window is open.
+        if (Environment.TickCount64 - armoireAt > 1000)
+        {
+            SaveArmoire();
+            armoireAt = Environment.TickCount64;
+        }
         if (ownedOnly && Environment.TickCount64 - ownedAt > 1000)
         {
             LoadOwned();
@@ -462,8 +612,9 @@ public class MainWindow : Window, IDisposable
         // Save once the drag ends, not every frame.
         if (ImGui.IsItemDeactivatedAfterEdit())
             Plugin.Config.Save();
-        // Pinned to the right edge, but never over the slider.
-        const string hint = "Right click: copy name, Shift+right click: Search for Item";
+        // Pinned to the right edge, but never over the slider. The magnifier is only on previews.
+        const string clicks = "Right click: copy name, Shift+right click: Search for Item";
+        var hint = previews ? clicks + ", Alt: zoom" : clicks;
         ImGui.SameLine();
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X - ImGui.CalcTextSize(hint).X));
         ImGui.TextDisabled(hint);
@@ -487,13 +638,13 @@ public class MainWindow : Window, IDisposable
             }
         }
 
+        DrawChoice();
         DrawHistory();
         DrawStatusBar(female);
     }
 
-    // The row above the status bar, with a small gap under it: what the last action did on the left; on the right, but never
-    // over the text, the revert button, then back and forward through the items put on. The arrows are wider than the other
-    // icon buttons; a wider gap sets the revert button apart from them.
+    // The row above the status bar: the last action's status on the left; on the right, never over it, the revert button and
+    // the history arrows, wider than other icon buttons.
     private void DrawHistory()
     {
         var style = ImGui.GetStyle();
@@ -530,10 +681,8 @@ public class MainWindow : Window, IDisposable
         }
     }
 
-    // The row above the tabs: Glamourer's toggles, buttons as the gender switch, lit up when on and grayed out when off.
-    // Ears only for Viera: no other race has the toggle. The race comes from Glamourer's state, as the character looks now:
-    // a race Glamourer has changed doesn't show in the game object's customize. Then the dyes button, set apart from them
-    // by a wider gap. Saving a preset is pinned to the right edge, but never over the rest.
+    // The row above the tabs: Glamourer's toggles (lit up when on), the dyes button, and saving a preset on the right.
+    // Ears only for Viera, by the race in Glamourer's state: a race it changed doesn't show in the game object's customize.
     private void DrawControls()
     {
         // Shared with the dyes window: one read of Glamourer's state for both.
@@ -607,9 +756,8 @@ public class MainWindow : Window, IDisposable
 
     private static string OnOff(string name, bool on) => $"{name}: {(on ? "on" : "off")}";
 
-    // One row at the bottom of the window: the list above leaves room for it. On the left, in preview mode the packs button,
-    // the gender switch and the update notice, then the armoire warning. The patch filter is pinned to the right edge,
-    // but never over the rest.
+    // The bottom row: in preview mode the packs button, the gender switch and the pack notices, then the armoire warning;
+    // the patch filter on the right, never over the rest.
     private void DrawStatusBar(bool female)
     {
         ImGui.SetCursorPosY(ImGui.GetWindowContentRegionMax().Y - ImGui.GetFrameHeight());
@@ -654,7 +802,7 @@ public class MainWindow : Window, IDisposable
         var character = Plugin.PlayerState.ContentId;
         if (Plugin.Config.OwnedOnly && character != 0 && !Plugin.Config.Armoire.ContainsKey(character))
         {
-            ImGui.TextColored(ImGuiColors.DalamudYellow, "Armoire items are missing: open the armoire once at an inn.");
+            ImGui.TextColored(ImGuiColors.DalamudYellow, "Armoire items are missing: open the armoire at an inn to sync it with BetterDresser.");
             ImGui.SameLine();
         }
 
@@ -694,7 +842,6 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Only items added in this patch or expansion. Items newer than the plugin's patch data show only under All.");
     }
 
-    // Yellow text in the status bar that opens the packs window.
     private void DrawPacksNotice(string text)
     {
         ImGui.TextColored(ImGuiColors.DalamudYellow, text);
@@ -715,6 +862,7 @@ public class MainWindow : Window, IDisposable
         {
             UpdateJobCategories();
             list = list.Where(e => jobCategories.Contains(e.JobCategory));
+            folders = WeaponFolders(slot, pack!, list);
         }
 
         if (Plugin.Config.OwnedOnly)
@@ -723,10 +871,7 @@ public class MainWindow : Window, IDisposable
         if (Plugin.Config.HideStore)
             list = list.Where(e => !e.Store);
 
-        // With previews, only what the gender shown can wear: an item locked to the other gender is left out.
         var previews = Plugin.Config.Previews;
-        if (previews)
-            list = list.Where(e => female ? e.Female : e.Male);
 
         // A patch version or an expansion name: they never collide.
         var patch = Plugin.Config.Patch;
@@ -743,11 +888,10 @@ public class MainWindow : Window, IDisposable
         if (!child)
             return;
 
-        var entries = list.ToList();
         // Every tile in a tab is the same size, so the list can skip the rows out of view.
         var shapePack = pack ?? GenderPack(female);
         var size = previews
-            ? new Vector2(1, PreviewAspect(shapePack, ShapeFolder(shapePack, folders, entries))) * Plugin.Config.PreviewWidth * ImGuiHelpers.GlobalScale
+            ? new Vector2(1, PreviewAspect(shapePack, folders[0])) * Plugin.Config.PreviewWidth * ImGuiHelpers.GlobalScale
             : new Vector2(Plugin.Config.IconSize * ImGuiHelpers.GlobalScale);
         // The same gap across and down: the style's vertical item spacing is smaller than the horizontal one.
         var gap = ImGui.GetStyle().ItemSpacing.X;
@@ -759,8 +903,48 @@ public class MainWindow : Window, IDisposable
         if (previews && wheel != 0 && ImGui.IsWindowHovered())
             ImGui.SetScrollY(ImGui.GetScrollY() - wheel * (size.Y + gap) / 4);
 
-        ImGuiClip.ClippedDraw(entries, e => DrawTile(slot, e, size, previews, previews ? PreviewOf(pack, folders, e, female) : null),
-            columns, size.Y + gap);
+        // One tile per model, where its first item is in the list, showing the first item the gender shown can wear (else the
+        // first, faded, with the other gender's shot). Regrouped only when the key changes, so a new filter goes into it too.
+        var key = (slot, cachedJob, Plugin.Config.OwnedOnly ? ownedAt : 0, Plugin.Config.HideStore, Plugin.Config.Patch, search);
+        if (key != tilesKey)
+        {
+            tilesKey = key;
+            tiles = list.GroupBy(e => (e.ModelMain, e.ModelSub)).Select(g => g.ToList()).ToList();
+        }
+        ImGuiClip.ClippedDraw(tiles, t =>
+        {
+            var fit = t.Find(e => female ? e.Female : e.Male);
+            DrawTile(slot, t, fit ?? t[0], size, previews,
+                previews ? PreviewOf(pack, folders, t[0].ModelMain, fit != null ? female : !female) : null, previews && fit == null);
+        }, columns, size.Y + gap);
+    }
+
+    // Asked on a right click on a tile of several items: the one to copy the name of, or with Shift to search for.
+    // Here rather than in the list, so it stays open when its tile scrolls out of view.
+    private void DrawChoice()
+    {
+        if (openChoice)
+        {
+            ImGui.OpenPopup("##choice");
+            openChoice = false;
+        }
+
+        using var popup = ImRaii.Popup("##choice");
+        if (!popup || choice is not { } c)
+            return;
+
+        ImGui.TextDisabled(c.Search ? "Search for Item:" : "Copy name:");
+        foreach (var e in c.Items)
+        {
+            using var id = ImRaii.PushId((int)e.Id);
+            if (!ImGui.Selectable(e.Name))
+                continue;
+
+            if (c.Search)
+                SearchItem(e);
+            else
+                CopyName(e);
+        }
     }
 
     // Dye channels as the game marks them: small circles down the right edge from the top right corner, the first one on top.
@@ -775,30 +959,45 @@ public class MainWindow : Window, IDisposable
         }
     }
 
-    // Online Store mark: a yellow dollar sign with a black outline, flush with the bottom right corner.
-    // Under a third of the icon tall, so it stays clear of the two dye circles above it.
-    private static unsafe void DrawStore(ImDrawListPtr draw, Vector2 bottomRight, float icon)
+    private static void DrawStore(ImDrawListPtr draw, Vector2 bottomRight, float icon) =>
+        DrawMark(draw, FontAwesomeIcon.DollarSign, bottomRight, true, icon, ImGui.GetColorU32(ImGuiColors.DalamudYellow));
+
+    // Items for one gender only.
+    private static void DrawGender(ImDrawListPtr draw, Vector2 topLeft, float icon, bool female) =>
+        DrawMark(draw, female ? FontAwesomeIcon.Venus : FontAwesomeIcon.Mars, topLeft, false, icon, 0xFFFFFFFF);
+
+    // A Font Awesome mark with a black outline in a corner of the icon: the top left or the bottom right one.
+    // Under a third of the icon tall, so it stays clear of the two dye circles down the right edge.
+    private static unsafe void DrawMark(ImDrawListPtr draw, FontAwesomeIcon mark, Vector2 corner, bool bottomRight, float icon, uint color)
     {
         var font = UiBuilder.IconFont;
         var size = icon / 3.5f;
         // Same width as the dye circles' outline.
         var outline = Math.Max(1, icon / 32);
         // Glyph bounds are given at the font's own size: the ink itself, outline included, goes into the corner.
-        var glyph = font.FindGlyph(FontAwesomeIcon.DollarSign.ToIconChar());
-        var at = bottomRight - new Vector2(glyph->X1, glyph->Y1) * (size / font.FontSize) - new Vector2(outline);
+        var glyph = font.FindGlyph(mark.ToIconChar());
+        var scale = size / font.FontSize;
+        var at = bottomRight
+            ? corner - new Vector2(glyph->X1, glyph->Y1) * scale - new Vector2(outline)
+            : corner - new Vector2(glyph->X0, glyph->Y0) * scale + new Vector2(outline);
 
-        var text = FontAwesomeIcon.DollarSign.ToIconString();
+        DrawOutlined(draw, font, size, at, outline, color, mark.ToIconString());
+    }
+
+    // Text with a black outline: drawn black a little off in eight directions first, so it shows on any picture.
+    private static void DrawOutlined(ImDrawListPtr draw, ImFontPtr font, float size, Vector2 at, float outline, uint color, string text)
+    {
         for (var dx = -1; dx <= 1; dx++)
             for (var dy = -1; dy <= 1; dy++)
                 if (dx != 0 || dy != 0)
                     draw.AddText(font, size, at + new Vector2(dx, dy) * outline, 0xFF000000, text);
-        draw.AddText(font, size, at, ImGui.GetColorU32(ImGuiColors.DalamudYellow), text);
+        draw.AddText(font, size, at, color, text);
     }
 
-    // A gray tile with the preview fitted inside and the game icon in the top left corner;
-    // without a preview (missing, still loading or icon mode) the icon sits in the middle.
-    // In icon mode the tile is icon-sized, so the icon covers it with no frame around.
-    private void DrawTile(ApiEquipSlot slot, Entry e, Vector2 size, bool previews, string? preview)
+    // The items of one model as a gray tile showing e: its preview fitted in with the game icon top left, or without one
+    // (missing, loading, icon mode) the icon in the middle, covering the tile in icon mode. A left click puts e on.
+    // Faded: the gender shown can't wear any of the items.
+    private void DrawTile(ApiEquipSlot slot, List<Entry> items, Entry e, Vector2 size, bool previews, string? preview, bool faded)
     {
         using var id = ImRaii.PushId((int)e.Id);
         var min = ImGui.GetCursorScreenPos();
@@ -807,45 +1006,110 @@ public class MainWindow : Window, IDisposable
             Apply(slot, e);
         if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
         {
-            if (ImGui.GetIO().KeyShift)
+            var search = ImGui.GetIO().KeyShift;
+            if (items.Count > 1)
+            {
+                choice = (items, search);
+                openChoice = true;
+            }
+            else if (search)
                 SearchItem(e);
             else
                 CopyName(e);
         }
         var hovered = ImGui.IsItemHovered();
-        if (hovered)
-            ImGui.SetTooltip(e.Store ? $"{e.Name}\nOnline Store" : e.Name);
+        // Only when every item of the tile is from the store: otherwise the look can be had in the game.
+        var store = items.All(x => x.Store);
+        // The gender every item of the tile is locked to: true female, false male, null if the look is for both.
+        bool? gender = !items.Any(x => x.Male) ? true : !items.Any(x => x.Female) ? false : null;
+        // Alt over a preview shows the magnifier instead of the tooltip, which would cover it.
+        var lens = false;
 
         var draw = ImGui.GetWindowDrawList();
         draw.AddRectFilled(min, max, ImGui.GetColorU32(ImGuiCol.FrameBg));
 
         var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(e.Icon)).GetWrapOrEmpty();
+        Vector2 corner, iconSize;
         if (preview != null && Plugin.TextureProvider.GetFromFile(preview).TryGetWrap(out var image, out _))
         {
             var scale = Math.Min(size.X / image.Width, size.Y / image.Height);
             var fit = new Vector2(image.Width, image.Height) * scale;
             var at = min + (size - fit) / 2;
             draw.AddImage(image.Handle, at, at + fit);
+            lens = hovered && ImGui.GetIO().KeyAlt;
+            if (lens)
+                DrawLens(image.Handle, at, fit);
 
-            var iconSize = new Vector2(Math.Min(IconSize * ImGuiHelpers.GlobalScale, size.X / 3));
-            var corner = min + new Vector2(4 * ImGuiHelpers.GlobalScale);
-            draw.AddImage(icon.Handle, corner, corner + iconSize);
-            DrawDyes(draw, corner + new Vector2(iconSize.X, 0), iconSize.X, e.Dyes);
-            if (e.Store)
-                DrawStore(draw, corner + iconSize, iconSize.X);
+            iconSize = new Vector2(Math.Min(IconSize * ImGuiHelpers.GlobalScale, size.X / 3));
+            corner = min + new Vector2(4 * ImGuiHelpers.GlobalScale);
         }
         else
         {
-            var iconSize = previews ? new Vector2(IconSize * ImGuiHelpers.GlobalScale) : size;
-            var at = min + (size - iconSize) / 2;
-            draw.AddImage(icon.Handle, at, at + iconSize);
-            DrawDyes(draw, at + new Vector2(iconSize.X, 0), iconSize.X, e.Dyes);
-            if (e.Store)
-                DrawStore(draw, at + iconSize, iconSize.X);
+            iconSize = previews ? new Vector2(IconSize * ImGuiHelpers.GlobalScale) : size;
+            corner = min + (size - iconSize) / 2;
         }
+        draw.AddImage(icon.Handle, corner, corner + iconSize);
+        DrawDyes(draw, corner + new Vector2(iconSize.X, 0), iconSize.X, e.Dyes);
+        if (store)
+            DrawStore(draw, corner + iconSize, iconSize.X);
+        if (gender is { } f)
+            DrawGender(draw, corner, iconSize.X, f);
+
+        if (previews)
+            DrawModelMarks(draw, new Vector2(max.X, min.Y), HasVfx(slot, e.ModelMain), slot == ApiEquipSlot.Head && HasVisor(e.ModelMain));
+
+        // Half sunk into the window background, the icon and the marks along with the preview.
+        if (faded)
+            draw.AddRectFilled(min, max, ImGui.GetColorU32(ImGuiCol.WindowBg, 0.6f));
 
         if (hovered)
+        {
+            if (!lens)
+            {
+                var names = string.Join("\n", items.Select(x => x.Store ? $"{x.Name} (Online Store)" : x.Name));
+                ImGui.SetTooltip(gender switch { true => $"{names}\nFemale only", false => $"{names}\nMale only", null => names });
+            }
             draw.AddRect(min, max, ImGui.GetColorU32(ImGuiCol.ButtonHovered), 0, ImDrawFlags.None, 2);
+        }
+    }
+
+    // What the model does beyond its look, in the top right corner of a preview tile, right to left: a VFX, then a visor
+    // to toggle. Gray marks with a black outline: plain gray was lost on the gray backgrounds of the previews.
+    private static unsafe void DrawModelMarks(ImDrawListPtr draw, Vector2 topRight, bool vfx, bool visor)
+    {
+        var font = UiBuilder.IconFont;
+        var color = ImGui.GetColorU32(ImGuiColors.DalamudGrey);
+        // A whole pixel thin, and the marks on whole pixels: half pixels blur the glyph and smear the outline.
+        var outline = Math.Max(1, MathF.Round(ImGuiHelpers.GlobalScale));
+        var edge = 8 * ImGuiHelpers.GlobalScale;
+        var gap = 4 * ImGuiHelpers.GlobalScale;
+        var right = topRight.X - edge;
+        foreach (var mark in new[] { vfx ? FontAwesomeIcon.WandMagicSparkles : 0, visor ? FontAwesomeIcon.Glasses : 0 })
+        {
+            if (mark == 0)
+                continue;
+
+            // Glyph bounds, so the ink itself sits off the edges.
+            var glyph = font.FindGlyph(mark.ToIconChar());
+            var at = new Vector2(MathF.Round(right - glyph->X1), MathF.Round(topRight.Y + edge - glyph->Y0));
+            DrawOutlined(draw, font, font.FontSize, at, outline, color, mark.ToIconString());
+            right = at.X + glyph->X0 - gap;
+        }
+    }
+
+    // A square of the preview around the mouse, zoomed in, over every window. Never bigger than the zoomed preview,
+    // and kept inside it: by the edges the part shown stops following the mouse rather than run off the picture.
+    private static void DrawLens(ImTextureID texture, Vector2 at, Vector2 fit)
+    {
+        var size = Vector2.Min(new Vector2(LensSize * ImGuiHelpers.GlobalScale), fit * LensZoom);
+        var mouse = ImGui.GetMousePos();
+        // The part of the preview in the lens, in texture coordinates.
+        var span = size / (fit * LensZoom);
+        var center = Vector2.Clamp((mouse - at) / fit, span / 2, Vector2.One - span / 2);
+        var min = mouse - size / 2;
+        var draw = ImGui.GetForegroundDrawList();
+        draw.AddImage(texture, min, min + size, center - span / 2, center + span / 2);
+        draw.AddRect(min, min + size, ImGui.GetColorU32(ImGuiCol.Border), 0, ImDrawFlags.None, 2);
     }
 
     private void CopyName(Entry e)

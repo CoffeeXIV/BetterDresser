@@ -39,24 +39,24 @@ Sea of Stars, for Penumbra and Glamourer (skip it if you have them already):
 Open the catalog with `/bdresser` or `/betterdresser`.
 
 - Gear is sorted into tabs by slot, newest items first. Weapons show only the ones your current job can use.
-- Click an item to put it on. Right click copies its name, Shift+right click opens the game's "Search for Item" for it.
+- Click an item to put it on. Right click copies its name, Shift+right click opens the game's "Search for Item" for it, Alt zooms on preview.
 - Save preset to Glamourer saves what you wear as a new Glamourer design and opens it in Glamourer. Only the gear
-  is applied from it, not your character's appearance, so it can go on any character.
+  is applied, not your character's appearance, so it can go on any character.
 - Works in GPose too.
 
 ### Filters
 
 - Search by name.
 - Owned: only the items this character has, in the bags, armoury chest, equipped, with retainers, in the saddlebags,
-  the glamour dresser and the armoire. Retainers, saddlebags and the dresser count once you have opened them;
-  the armoire, once you have opened it at an inn.
+  the glamour dresser and the armoire. The armoire item list is synced with BetterDresser if you open the plugin
+  any time after opening the armoire, before logging out.
 - Hide store: hides Online Store items, which are marked with a yellow `$`. The list comes from the game's
   Dream Fitting, which misses some store items.
 - Filter by patch: only items added in a given patch or expansion.
 
 ### Previews
 
-The previews come in packs: male clothes, female clothes, accessories and weapons. They are downloaded from the releases
+The previews come in packs: male clothes, female clothes, accessories and weapons (with craft & gather tools). They are downloaded from the releases
 of [BetterDresser-Packs](https://github.com/CoffeeXIV/BetterDresser-Packs) in the packs window.
 
 Game patches bring new gear, and new previews with it. The bottom bar tells you when an update or a new pack is out,
