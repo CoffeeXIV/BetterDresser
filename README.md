@@ -39,7 +39,7 @@ Sea of Stars, for Penumbra and Glamourer (skip it if you have them already):
 Open the catalog with `/bdresser` or `/betterdresser`.
 
 - Gear is sorted into tabs by slot, newest items first. Weapons show only the ones your current job can use.
-- Click an item to put it on. Right click copies its name, Shift+right click opens the game's "Search for Item" for it, Alt zooms on preview.
+- Click an item to put it on. Right click copies its name, Shift+right click opens the game's "Search for Item" for it, Alt zooms in on a preview.
 - Save preset to Glamourer saves what you wear as a new Glamourer design and opens it in Glamourer. Only the gear
   is applied, not your character's appearance, so it can go on any character.
 - Works in GPose too.
