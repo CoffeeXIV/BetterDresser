@@ -3,14 +3,13 @@ using Glamourer.Api.Enums;
 
 namespace Dresser;
 
-// Gear put on from the catalog and dyes changed in the dyes window, to step back and forward through. In memory, per character.
+// Gear and dye changes to step back and forward through. In memory, per character.
 public class History(Pins pins)
 {
-    // One click in the catalog or the dyes window: its slots before and after it. After is taken again on each step back and before on each
-    // step forward, so back then forward returns to the same look, dyes changed in between included.
+    // One change: its slots before and after. Each step re-reads the side it leaves, so back then forward keeps later dye changes.
     private record Step(string Name, ApiEquipSlot[] Slots, Look[] Before, Look[] After);
 
-    // One character's steps and how many of them are done; the ones after can be done again.
+    // One character's steps and how many are done.
     private class Line
     {
         public readonly List<Step> Steps = [];
@@ -30,15 +29,14 @@ public class History(Pins pins)
         }
     }
 
-    // The item put on by the step back or forward, null if there is none.
+    // Names of the steps back and forward, null if none.
     internal string? BackName => Current is { Done: > 0 } line ? line.Steps[line.Done - 1].Name : null;
     internal string? ForwardName => Current is var line && line.Done < line.Steps.Count ? line.Steps[line.Done].Name : null;
 
     // The slots as they are now, null without a state. Throws when Glamourer is not available.
     internal Look[]? Take(ApiEquipSlot[] slots) => pins.Get(slots);
 
-    // After putting an item on or dyeing: a new step in place of the ones stepped back from. After is an array of its own even without
-    // a state to read: a step back keeps the look it leaves there, and in before's array it would overwrite what it goes back to.
+    // A new step in place of the ones stepped back from. After is always its own array: Move writes into it.
     internal void Add(string name, ApiEquipSlot[] slots, Look[] before)
     {
         var line = Current;
@@ -47,7 +45,7 @@ public class History(Pins pins)
         line.Done = line.Steps.Count;
     }
 
-    // Throws when Glamourer is not available. A step Glamourer refused is passed all the same, so it can't block the rest.
+    // Throws when Glamourer is not available. A refused step is passed anyway, so it can't block the rest.
     internal GlamourerApiEc Back()
     {
         var line = Current;
@@ -66,7 +64,7 @@ public class History(Pins pins)
         return result;
     }
 
-    // Keeps what the slots show now in `now`, all read before any of them changes, then puts `to` on them.
+    // Saves the slots into `now` before any changes, then puts `to` on.
     private GlamourerApiEc Move(ApiEquipSlot[] slots, Look[] now, Look[] to)
     {
         if (pins.Get(slots) is { } current)

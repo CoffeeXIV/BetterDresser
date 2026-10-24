@@ -15,22 +15,23 @@ using Newtonsoft.Json.Linq;
 
 namespace Dresser;
 
-// Dyes of the gear on the character: read from Glamourer's state and written back into it. Each change is a step in the history.
+// Dyes of the gear worn, from Glamourer's state. Each change is a history step.
 public class DyesWindow : Window
 {
     private record Dye(uint Id, string Name, Vector4 Color, byte Shade);
-    // An item worn, as Glamourer's state has it: GlamourId is what SetItem takes for it.
-    private record Row(ApiEquipSlot Slot, Item Item, string Name, ulong GlamourId, JObject Equip);
+    // GlamourId: what SetItem takes. OffEquip: the off hand of a paired weapon (daggers), whose dyes follow the main hand.
+    private record Row(ApiEquipSlot Slot, Item Item, string Name, ulong GlamourId, JObject Equip, JObject? OffEquip = null)
+    {
+        public bool Paired => OffEquip != null;
+    }
 
     private const float IconSize = 40;
-    // Dyes per palette row; a color group longer than that wraps.
+    // Dyes per palette row.
     private const int PaletteColumns = 10;
     private const ImGuiColorEditFlags DyeFlags = ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoDragDrop | ImGuiColorEditFlags.AlphaPreview;
-    // Drag and drop between dye squares.
     private const string DragType = "BetterDresserDye";
 
-    // In the catalog's tab order; Glamourer's state keys are their names. No accessories: none of them take dyes
-    // (checked over the whole Item sheet).
+    // In tab order. No accessories: none take dyes.
     private static readonly ApiEquipSlot[] Slots =
     [
         ApiEquipSlot.MainHand, ApiEquipSlot.OffHand, ApiEquipSlot.Head, ApiEquipSlot.Body, ApiEquipSlot.Hands, ApiEquipSlot.Legs,
@@ -43,12 +44,12 @@ public class DyesWindow : Window
     private readonly Dye[] dyes;
     private readonly Dictionary<uint, Dye> dyeById;
 
-    // What the last copy or dye change did, or why it didn't go on: under the items. A state read doesn't wipe it out.
+    // The last dye action's result; kept apart from the state error so a state read doesn't wipe it.
     private string status = string.Empty;
     private string dyeSearch = string.Empty;
-    // The dyes copied from an item, as many as it takes; null until one is copied. Kept until the plugin reloads.
+    // Dyes copied from an item, as many as it takes; null until a copy.
     private List<byte>? copied;
-    // Names cut to fit, by name: the width and font size they were cut for. One entry per item ever shown here.
+    // Names cut to fit, with the width and font size they were cut for.
     private readonly Dictionary<string, (float Width, float FontSize, string Text)> fitted = [];
 
     public DyesWindow(Pins pins, History history) : base("BetterDresser Dyes")
@@ -58,7 +59,7 @@ public class DyesWindow : Window
         Size = new Vector2(360, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
 
-        // Row 0 is "no dye": transparent, so its button shows the checkerboard.
+        // Row 0 is "no dye": transparent, shown as a checkerboard.
         dyes = Plugin.DataManager.GetExcelSheet<Stain>()
             .OrderBy(s => s.Shade).ThenBy(s => s.SubOrder)
             .Select(s => new Dye(s.RowId, s.Name.ExtractText(), s.RowId == 0 ? Vector4.Zero : ToColor(s.Color), s.Shade))
@@ -71,7 +72,7 @@ public class DyesWindow : Window
     private static Vector4 ToColor(uint rgb) =>
         new(((rgb >> 16) & 0xFF) / 255f, ((rgb >> 8) & 0xFF) / 255f, (rgb & 0xFF) / 255f, 1);
 
-    // The items worn, in the catalog's tab order. Empty slots have Glamourer's own ids that aren't in the Item sheet.
+    // The items worn. Empty slots have Glamourer ids outside the Item sheet.
     private List<Row> Rows()
     {
         var rows = new List<Row>();
@@ -85,6 +86,13 @@ public class DyesWindow : Window
                 || sheet.GetRowOrDefault((uint)itemId) is not { } item)
                 continue;
 
+            // The off hand of a paired weapon is the same item as the main hand.
+            if (slot == ApiEquipSlot.OffHand && rows.Count > 0 && rows[^1].Slot == ApiEquipSlot.MainHand && rows[^1].Item.RowId == item.RowId)
+            {
+                rows[^1] = rows[^1] with { OffEquip = equip };
+                continue;
+            }
+
             var name = item.Name.ExtractText();
             if (name.Length > 0)
                 rows.Add(new Row(slot, item, name, Pins.IdOf(slot, itemId), equip));
@@ -94,7 +102,6 @@ public class DyesWindow : Window
 
     public override void Draw()
     {
-        // Shared with the catalog: one read of Glamourer's state for both.
         pins.RefreshState();
         var rows = Rows();
 
@@ -107,7 +114,6 @@ public class DyesWindow : Window
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Items put on from the catalog keep the slot's current dyes.");
 
-        // A gap between the checkbox and the items.
         ImGui.Dummy(new Vector2(0, ImGui.GetFrameHeight()));
 
         if (pins.StateError.Length > 0)
@@ -116,7 +122,7 @@ public class DyesWindow : Window
         var icon = IconSize * ImGuiHelpers.GlobalScale;
         var button = ImGui.GetFrameHeight();
         var spacing = ImGui.GetStyle().ItemSpacing.X;
-        // Between the name, the dye squares and copy and paste.
+        // Between the button groups.
         var gap = ImGui.GetFrameHeight();
         var draw = ImGui.GetWindowDrawList();
 
@@ -125,12 +131,12 @@ public class DyesWindow : Window
             using var pushId = ImRaii.PushId((int)row.Slot);
             var min = ImGui.GetCursorScreenPos();
             var right = min.X + ImGui.GetContentRegionAvail().X;
-            // Right to left: clear, copy and paste, the dye squares. Names end at one place, with room for two dyes, cut short
-            // with an ellipsis; an item that takes no dyes has no squares or buttons.
+            // Right to left: clear, copy and paste, swap, two dye columns. Fixed columns, so every row lines up.
             var clearLeft = right - button;
             var copyLeft = clearLeft - gap - 2 * button - spacing;
-            var dyesLeft = copyLeft - gap - row.Item.DyeCount * (button + spacing) + spacing;
-            var nameRight = copyLeft - gap - 2 * button - spacing - gap;
+            var swapLeft = copyLeft - gap - button;
+            var dyesLeft = swapLeft - 2 * (button + spacing);
+            var nameRight = dyesLeft - gap;
             var buttonsTop = min.Y + (icon - button) / 2;
 
             draw.AddImage(Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(row.Item.Icon)).GetWrapOrEmpty().Handle, min, min + new Vector2(icon));
@@ -146,18 +152,23 @@ public class DyesWindow : Window
                     ImGui.SetCursorScreenPos(new Vector2(dyesLeft + channel * (button + spacing), buttonsTop));
                     DrawDye(row, channel);
                 }
+                if (row.Item.DyeCount > 1)
+                {
+                    ImGui.SetCursorScreenPos(new Vector2(swapLeft, buttonsTop));
+                    DrawSwap(row);
+                }
                 ImGui.SetCursorScreenPos(new Vector2(copyLeft, buttonsTop));
                 DrawCopyPaste(row);
                 ImGui.SetCursorScreenPos(new Vector2(clearLeft, buttonsTop));
                 DrawClear(row);
             }
 
-            // One item for the whole row, so the next row starts below it.
+            // One item for the whole row, so the next starts below it.
             ImGui.SetCursorScreenPos(min);
             ImGui.Dummy(new Vector2(right - min.X, icon));
         }
 
-        // Below the items, on the right: paste to all and clear all, each one step.
+        // Paste to all and clear all, each one step.
         ImGui.Dummy(new Vector2(0, ImGui.GetFrameHeight()));
         const string pasteAll = "Paste to all", clearAll = "Clear all";
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X
@@ -168,7 +179,7 @@ public class DyesWindow : Window
         {
             if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.PaintBrush, pasteAll) && copied != null)
                 Apply($"Pasted to all: {Names(copied)}", $"{Names(copied)} on all items",
-                    dyeable.Select(r => (r.Slot, r.GlamourId, Pasted(r))).ToArray());
+                    dyeable.SelectMany(r => Changes(r, Pasted(r))).ToArray());
         }
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(copied != null ? $"Paste dyes on every item worn: {Names(copied)}" : "Copy an item's dyes first.");
@@ -178,27 +189,26 @@ public class DyesWindow : Window
         using (ImRaii.Disabled(dyed.Count == 0))
         {
             if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Eraser, clearAll))
-                Apply("Cleared all dyes", "No dyes on all items", dyed.Select(r => (r.Slot, r.GlamourId, new List<byte> { 0, 0 })).ToArray());
+                Apply("Cleared all dyes", "No dyes on all items", dyed.SelectMany(r => Changes(r, [0, 0])).ToArray());
         }
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(dyed.Count > 0 ? "Clear the dyes of every item worn." : "No dyes to clear.");
 
-        // As the main window's status, for dyes only, pinned to the right edge under the buttons.
+        // Right-aligned under the buttons.
         if (status.Length > 0)
         {
             ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X - ImGui.CalcTextSize(status).X));
             ImGui.TextUnformatted(status);
         }
 
-        // Two lines pinned to the bottom of the window, but never over the rest.
+        // At the bottom, never over the rest.
         ImGui.SetCursorPosY(Math.Max(ImGui.GetCursorPosY(),
             ImGui.GetWindowContentRegionMax().Y - ImGui.GetTextLineHeightWithSpacing() - ImGui.GetTextLineHeight()));
         ImGui.TextDisabled("Drag and drop a dye onto another one to apply it.");
         ImGui.TextDisabled("Right click a dye to clear it.");
     }
 
-    // The text cut short with three dots to fit the width. ImGui's own ellipsis takes the font's, which sits mid-line.
-    // Measured a character at a time, so kept per name until the width or the font size changes.
+    // Cut with "..." to fit: ImGui's ellipsis glyph sits mid-line in Dalamud's font. Cached, as it's measured per character.
     private string Fit(string text, float width)
     {
         var fontSize = ImGui.GetFontSize();
@@ -224,20 +234,36 @@ public class DyesWindow : Window
         return cut;
     }
 
-    // A square button like copy and paste: no dyes on the item. Off when it has none already.
+    // Clears the item's dyes.
     private void DrawClear(Row row)
     {
         var none = Undyed(row);
         using (ImRaii.Disabled(none))
         {
             if (ImGuiComponents.IconButton(FontAwesomeIcon.Eraser, new Vector2(ImGui.GetFrameHeight())))
-                Apply("Cleared dyes", $"No dyes on {row.Name}", [(row.Slot, row.GlamourId, [0, 0])]);
+                Apply("Cleared dyes", $"No dyes on {row.Name}", Changes(row, [0, 0]));
         }
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(none ? "No dyes to clear." : "Clear dyes");
     }
 
-    // Square buttons the size of the dye squares, side by side.
+    // Swaps the first and second dyes.
+    private void DrawSwap(Row row)
+    {
+        var stains = Pins.Stains(row.Equip);
+        var same = stains[0] == stains[1];
+        using (ImRaii.Disabled(same))
+        {
+            if (ImGuiComponents.IconButton(FontAwesomeIcon.Retweet, new Vector2(ImGui.GetFrameHeight())))
+            {
+                (stains[0], stains[1]) = (stains[1], stains[0]);
+                Apply($"Swapped: {Names(stains)}", $"{Names(stains)} on {row.Name}", Changes(row, stains));
+            }
+        }
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(same ? "Both dyes are the same." : "Swap dyes");
+    }
+
     private void DrawCopyPaste(Row row)
     {
         var size = new Vector2(ImGui.GetFrameHeight());
@@ -254,19 +280,27 @@ public class DyesWindow : Window
         using (ImRaii.Disabled(copied == null))
         {
             if (ImGuiComponents.IconButton(FontAwesomeIcon.PaintBrush, size) && copied != null)
-                Apply($"Pasted: {Names(copied)}", $"{Names(copied)} on {row.Name}", [(row.Slot, row.GlamourId, Pasted(row))]);
+                Apply($"Pasted: {Names(copied)}", $"{Names(copied)} on {row.Name}", Changes(row, Pasted(row)));
         }
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(copied != null ? $"Paste dyes: {Names(copied)}" : "Copy an item's dyes first.");
     }
 
-    private static bool Undyed(Row row) => Pins.Stains(row.Equip).Take(row.Item.DyeCount).All(s => s == 0);
+    // The row's slot, and the off hand too for a paired weapon.
+    private static (ApiEquipSlot Slot, ulong Id, List<byte> Stains)[] Changes(Row row, List<byte> stains) =>
+        row.Paired
+            ? [(row.Slot, row.GlamourId, stains), (ApiEquipSlot.OffHand, Pins.IdOf(ApiEquipSlot.OffHand, row.Item.RowId), stains)]
+            : [(row.Slot, row.GlamourId, stains)];
+
+    // A paired weapon is dyed if either hand is: Glamourer can dye the off hand apart.
+    private static bool Undyed(Row row) =>
+        new[] { row.Equip, row.OffEquip }.OfType<JObject>().All(e => Pins.Stains(e).Take(row.Item.DyeCount).All(s => s == 0));
 
     private string DyeName(uint id) => dyeById.GetValueOrDefault(id)?.Name ?? $"Dye #{id}";
 
     private string Names(IEnumerable<byte> ids) => string.Join(" / ", ids.Select(id => DyeName(id)));
 
-    // The copied dyes over the item's own, as many as it takes: with one copied, its own second dye stays.
+    // The copied dyes over the item's own: with one copied, its second stays.
     private List<byte> Pasted(Row row)
     {
         var stains = Pins.Stains(row.Equip);
@@ -275,16 +309,14 @@ public class DyesWindow : Window
         return stains;
     }
 
-    // A square with the current dye; a click opens the palette. Dragged onto another square, it gives that one its dye.
-    // ImGui's own color drag is off (NoDragDrop): the payload is the dye id.
+    // A click opens the palette; dragged onto another square, gives it this dye (our payload, ImGui's color drag is off).
     private unsafe void DrawDye(Row row, int channel)
     {
         var current = Pins.Stains(row.Equip)[channel];
         var dye = dyeById.GetValueOrDefault(current);
         using var id = ImRaii.PushId(channel);
         var size = new Vector2(ImGui.GetFrameHeight());
-        // A drag let go over the square it started from counts as a click too: no palette then. ImGui keeps the payload
-        // through the frame the mouse is let go in, and drops it on the next.
+        // A drag let go over its own square counts as a click: the payload is still there that frame.
         if (ImGui.ColorButton("##dye", dye?.Color ?? Vector4.Zero, DyeFlags, size) && ImGui.GetDragDropPayload().IsNull)
         {
             dyeSearch = string.Empty;
@@ -308,7 +340,7 @@ public class DyesWindow : Window
             if (source)
             {
                 ImGui.SetDragDropPayload(DragType, [current], ImGuiCond.None);
-                // Follows the cursor in place of the name tooltip: the dye and its name.
+                // Follows the cursor instead of the tooltip.
                 ImGui.ColorButton("##dragged", dye?.Color ?? Vector4.Zero, DyeFlags, size);
                 ImGui.SameLine();
                 ImGui.TextUnformatted(DyeName(current));
@@ -322,7 +354,7 @@ public class DyesWindow : Window
             DrawPalette(row, channel, current);
     }
 
-    // Search on top, then a row of squares per color group, the name in a tooltip.
+    // Search, then a row of squares per color group.
     private void DrawPalette(Row row, int channel, uint current)
     {
         var size = ImGui.GetFrameHeight();
@@ -339,20 +371,20 @@ public class DyesWindow : Window
             if (dyeSearch.Length > 0 && !dye.Name.Contains(dyeSearch, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            // A new row for each color group and after every PaletteColumns dyes, a gap between groups.
+            // A new row per group and every PaletteColumns dyes, a gap between groups.
             if (dye.Shade == shade && column < PaletteColumns)
                 ImGui.SameLine();
             else
             {
                 if (shade != null && dye.Shade != shade)
-                    ImGui.Spacing();
+                    ImGui.Dummy(new Vector2(0, size / 2));
                 column = 0;
             }
             shade = dye.Shade;
             column++;
 
             using var id = ImRaii.PushId((int)dye.Id);
-            // The palette stays open to try other dyes, each one a step; a click outside closes it.
+            // Stays open to try other dyes, each one a step.
             if (ImGui.ColorButton("##dye", dye.Color, DyeFlags, new Vector2(size)))
                 SetDye(row, channel, dye.Id);
             if (ImGui.IsItemHovered())
@@ -362,23 +394,21 @@ public class DyesWindow : Window
         }
     }
 
-    // One dye of an item, picked in the palette or dragged from another square.
     private void SetDye(Row row, int channel, uint dye)
     {
         var stains = Pins.Stains(row.Equip);
         stains[channel] = (byte)dye;
-        Apply($"Dyed: {DyeName(dye)}", $"{DyeName(dye)} on {row.Name}", [(row.Slot, row.GlamourId, stains)]);
+        Apply($"Dyed: {DyeName(dye)}", $"{DyeName(dye)} on {row.Name}", Changes(row, stains));
     }
 
     private void ClearDye(Row row, int channel)
     {
         var stains = Pins.Stains(row.Equip);
         stains[channel] = 0;
-        Apply("Cleared dye", $"No dye on {row.Name}", [(row.Slot, row.GlamourId, stains)]);
+        Apply("Cleared dye", $"No dye on {row.Name}", Changes(row, stains));
     }
 
-    // Glamourer has no IPC for dyes alone: the same items go back on with the new dyes, in their slots only. One history
-    // step, name, even if some slot was refused (back undoes those that went on); done is the status below the items.
+    // No dye-only IPC in Glamourer: the same items go back on with new dyes. One step, even if some slot was refused.
     private void Apply(string done, string name, (ApiEquipSlot Slot, ulong Id, List<byte> Stains)[] changes)
     {
         if (changes.Length == 0)

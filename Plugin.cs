@@ -23,11 +23,10 @@ public sealed class Plugin : IDalamudPlugin
 
     internal static Config Config { get; private set; } = null!;
 
-    // The object index Glamourer dresses: the local player, or in GPose the player's GPose copy, which is always at 201.
+    // The object Glamourer dresses: the player, or in GPose their copy at 201.
     internal static int Actor => ClientState.IsGPosing ? 201 : 0;
 
-    // The gender the game has for the character, male with no character. A change in Glamourer doesn't show in the game object,
-    // and the previews aren't meant to switch on their own.
+    // The game's gender, male with no character. Glamourer's changes don't show here, and previews shouldn't switch by themselves.
     internal static bool CharacterFemale => ObjectTable[Actor] is ICharacter c && c.Customize[(int)CustomizeIndex.Gender] == 1;
 
     private static readonly string[] Commands = ["/bdresser", "/betterdresser"];
@@ -40,11 +39,11 @@ public sealed class Plugin : IDalamudPlugin
     public Plugin()
     {
         Config = PluginInterface.GetPluginConfig() as Config ?? new Config();
-        // Sizes saved before the slider clamped typed values, or edited by hand: a size of 0 breaks the grid.
+        // Old or hand-edited sizes: 0 breaks the grid.
         Config.PreviewWidth = Math.Clamp(Config.PreviewWidth, Config.MinPreviewWidth, Config.MaxPreviewWidth);
         Config.IconSize = Math.Clamp(Config.IconSize, Config.MinIconSize, Config.MaxIconSize);
         pins = new Pins();
-        // One history for both: the catalog's arrows step through gear and dyes alike.
+        // One history for gear and dyes.
         var history = new History(pins);
         var dyesWindow = new DyesWindow(pins, history);
         packsWindow = new PacksWindow();
@@ -73,7 +72,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= windowSystem.Draw;
         PluginInterface.UiBuilder.OpenMainUi -= mainWindow.Toggle;
         windowSystem.RemoveAllWindows();
-        // Unloaded with the catalog open: its gear turns temporary as if it were closed.
+        // As if the catalog were closed.
         pins.Release();
         mainWindow.Dispose();
         packsWindow.Dispose();

@@ -11,23 +11,22 @@ public class Config : IPluginConfiguration
 
     // Show model previews instead of game icons.
     public bool Previews { get; set; } = true;
-    // The preview packs window has been shown once, on the first open of the main window.
+    // The packs window has opened by itself once.
     public bool PacksOffered { get; set; }
-    // Packs offered the last time the packs window listed them, null before any list: the others are new.
+    // Packs the packs window has listed, null before any list; any other is new.
     public HashSet<string>? KnownPacks { get; set; }
     // Preview tile width; the height follows the previews' shape.
     public int PreviewWidth { get; set; } = 200;
     public int IconSize { get; set; } = 48;
     internal const int MinPreviewWidth = 80, MaxPreviewWidth = 500, MinIconSize = 32, MaxIconSize = 128;
-    // Show only the items the current character has somewhere.
     public bool OwnedOnly { get; set; }
-    // Hide items sold in the Online Store (as far as the game's Dream Fitting list knows).
+    // Online Store items, as the game's Dream Fitting list has them.
     public bool HideStore { get; set; }
-    // Show only the items added in this patch version or expansion (by name); empty for all.
+    // A patch version or an expansion name; empty for all.
     public string Patch { get; set; } = string.Empty;
-    // Items put on from the catalog keep the slot's current dyes instead of dropping them.
+    // Items put on from the catalog keep the slot's dyes.
     public bool KeepDyesOnGearChange { get; set; }
-    // Armoire item ids per character content id: the game loads the armoire only when it is opened.
+    // Armoire item ids per character: the game loads the armoire only when it's opened.
     public Dictionary<ulong, HashSet<uint>> Armoire { get; set; } = [];
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
